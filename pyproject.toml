@@ -1,0 +1,28 @@
+[project]
+name = "llamia"
+version = "0.1.0"
+description = "LLM training with VERL + vLLM"
+requires-python = ">=3.10"
+dependencies = [
+    "chess>=1.11.2",
+    "httpx>=0.28.1",
+    "verl>=0.7.1",
+    "vllm>=0.9.1",
+]
+
+[tool.uv]
+override-dependencies = [
+    "torch==2.7.0+cu126",
+    "torchvision==0.22.0+cu126",
+    "torchaudio==2.7.0+cu126",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu126" }]
+torchvision = [{ index = "pytorch-cu126" }]
+torchaudio = [{ index = "pytorch-cu126" }]
