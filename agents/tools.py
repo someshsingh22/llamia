@@ -1,6 +1,31 @@
 """lc0 HTTP client with concise output formatting for the LLM context."""
 from __future__ import annotations
+import chess
 import httpx
+
+
+def _uci_pv_to_san(fen: str, uci_moves: list[str]) -> str:
+    """Replay a UCI principal variation on a board and emit SAN.
+
+    SAN shows captures (Qxg5), checks (+), mates (#), and disambiguates
+    pieces, so the LLM cannot mistake e.g. `a5g5` for a quiet move when it
+    is actually `Qxg5+`.  Falls back to UCI for any move that fails to parse
+    (engine PVs are usually clean, but we don't want to crash on edge cases).
+    """
+    board = chess.Board(fen)
+    out: list[str] = []
+    for u in uci_moves:
+        try:
+            m = chess.Move.from_uci(u)
+            if m not in board.legal_moves:
+                out.append(u)
+                break
+            out.append(board.san(m))
+            board.push(m)
+        except (chess.InvalidMoveError, ValueError, AssertionError):
+            out.append(u)
+            break
+    return " ".join(out)
 
 
 class LcOClient:
@@ -24,13 +49,24 @@ class LcOClient:
                 score = f"M{pv['mate']}"
             else:
                 score = f"{(pv.get('score_cp') or 0) / 100:+.2f}"
-            moves = " ".join(pv.get("pv", [])[:6])
+            uci_moves = pv.get("pv", [])[:6]
+            san_pv = _uci_pv_to_san(fen, uci_moves)
             lines.append(
-                f"{pv['multipv']}. {moves}  score={score}  depth={pv.get('depth')}"
+                f"{pv['multipv']}. {san_pv}  score={score}  depth={pv.get('depth')}"
             )
+        # Translate the bestmove to SAN too, so the model sees Qxg5 not a5g5
+        best_san = None
+        if data.get("bestmove"):
+            try:
+                bm = chess.Move.from_uci(data["bestmove"])
+                bd = chess.Board(fen)
+                if bm in bd.legal_moves:
+                    best_san = bd.san(bm)
+            except (chess.InvalidMoveError, ValueError):
+                pass
         return {
             "turn": data.get("turn"),
-            "bestmove": data.get("bestmove"),
+            "bestmove": best_san or data.get("bestmove"),
             "lines": lines,
         }
 
