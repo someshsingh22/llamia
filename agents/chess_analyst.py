@@ -78,12 +78,15 @@ Tools (board is stateful across calls):
   for "what if?" questions instead of make_move/undo.
 - get_policy(nodes): raw NN priors P and values V per move (fast, 1 pass)
 
-Blunder analysis pattern (2 calls):
-  1. analyze() — see the engine's best move + eval for the current position.
-  2. analyze(moves=["<candidate>"]) — see the eval after the candidate move.
+Blunder analysis pattern (2 calls — issue them TOGETHER in one response):
+  - analyze() — engine's best move + eval for the current position.
+  - analyze(moves=["<candidate>"]) — eval after the candidate move.
 Compare the two evaluations; the difference is the centipawn loss.
-The PV from step 2 starts with the opponent's refutation (in SAN, e.g. Qxg5+).
-"""
+The PV from the second call starts with the opponent's refutation (SAN, e.g. Qxg5+).
+
+EFFICIENCY: when two tool calls are independent (don't depend on each
+other's results), emit BOTH in your same response. The harness dispatches
+them in parallel — you save a full round-trip."""
 
 # Tool definitions fed to the API (used by vllm to build the chat template's
 # tool list, which teaches the model what functions exist and their parameters).
@@ -304,8 +307,37 @@ class ChessAnalyst:
                     print(f"\n{'─'*60}\n[Answer]\n{visible_text or raw_content}\n")
                 return visible_text or raw_content
 
-            # Execute each tool call and append results
-            for call in tool_calls:
+            # Execute tool calls.  Pure-read, no-state-mutation tools
+            # (analyze, get_policy, get_position) run in parallel via threads;
+            # state-mutating tools (make_move, undo_move, reset_position)
+            # MUST stay sequential because order matters.
+            READ_ONLY_TOOLS = {"analyze", "get_policy", "get_position"}
+            ro_calls = [c for c in tool_calls if c["name"] in READ_ONLY_TOOLS]
+            mut_calls = [c for c in tool_calls if c["name"] not in READ_ONLY_TOOLS]
+
+            results: list[tuple[dict, Any]] = []
+            if len(ro_calls) > 1:
+                # Fan-out: dispatch all read-only calls concurrently.
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=len(ro_calls)) as pool:
+                    futures = [pool.submit(self._dispatch, c["name"], c["arguments"])
+                               for c in ro_calls]
+                    for c, fut in zip(ro_calls, futures):
+                        results.append((c, fut.result()))
+            else:
+                for c in ro_calls:
+                    results.append((c, self._dispatch(c["name"], c["arguments"])))
+
+            # Mutating calls run after the reads, in the order the model emitted them.
+            for c in mut_calls:
+                results.append((c, self._dispatch(c["name"], c["arguments"])))
+
+            # Re-emit results in the model's original call order so the
+            # tool-response messages line up with what it expects.
+            order_idx = {id(c): i for i, c in enumerate(tool_calls)}
+            results.sort(key=lambda pair: order_idx[id(pair[0])])
+
+            for call, result in results:
                 name = call["name"]
                 args = call["arguments"]
                 tool_call_count += 1
@@ -314,10 +346,6 @@ class ChessAnalyst:
                 if verbose:
                     arg_str = ", ".join(f"{k}={v!r}" for k, v in args.items())
                     print(f"  ⚙  {name}({arg_str})")
-
-                result = self._dispatch(name, args)
-
-                if verbose:
                     rs = json.dumps(result, indent=2)
                     preview = rs[:500] + ("…" if len(rs) > 500 else "")
                     print(f"     → {preview}\n")
