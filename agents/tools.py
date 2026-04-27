@@ -36,10 +36,45 @@ class LcOClient:
     def health(self) -> dict:
         return self._http.get(f"{self._url}/health").raise_for_status().json()
 
-    def analyze(self, fen: str, nodes: int = 800, multipv: int = 3) -> dict:
+    def analyze(
+        self,
+        fen: str,
+        nodes: int = 800,
+        multipv: int = 3,
+        moves: list[str] | None = None,
+    ) -> dict:
+        """Analyze a position, optionally after playing a sequence of moves.
+
+        `moves` is a list of UCI or SAN move strings to apply on top of the
+        FEN before analysis.  This is a no-mutate primitive: the agent's
+        ChessState is untouched.  Lets the model ask "what's the eval after
+        Nxd4?" in one call instead of make_move → analyze → undo.
+        """
+        # Resolve the analysis FEN: apply any candidate moves client-side.
+        analysis_fen = fen
+        applied_san: list[str] = []
+        if moves:
+            board = chess.Board(fen)
+            for mv in moves:
+                m = None
+                try:
+                    m = chess.Move.from_uci(mv.strip())
+                    if m not in board.legal_moves:
+                        m = None
+                except ValueError:
+                    pass
+                if m is None:
+                    try:
+                        m = board.parse_san(mv.strip())
+                    except ValueError:
+                        return {"error": f"Illegal move in `moves`: {mv!r}"}
+                applied_san.append(board.san(m))
+                board.push(m)
+            analysis_fen = board.fen()
+
         r = self._http.post(
             f"{self._url}/analyze",
-            json={"fen": fen, "nodes": nodes, "multipv": multipv},
+            json={"fen": analysis_fen, "nodes": nodes, "multipv": multipv},
         )
         r.raise_for_status()
         data = r.json()
@@ -50,25 +85,28 @@ class LcOClient:
             else:
                 score = f"{(pv.get('score_cp') or 0) / 100:+.2f}"
             uci_moves = pv.get("pv", [])[:6]
-            san_pv = _uci_pv_to_san(fen, uci_moves)
+            san_pv = _uci_pv_to_san(analysis_fen, uci_moves)
             lines.append(
                 f"{pv['multipv']}. {san_pv}  score={score}  depth={pv.get('depth')}"
             )
-        # Translate the bestmove to SAN too, so the model sees Qxg5 not a5g5
         best_san = None
         if data.get("bestmove"):
             try:
                 bm = chess.Move.from_uci(data["bestmove"])
-                bd = chess.Board(fen)
+                bd = chess.Board(analysis_fen)
                 if bm in bd.legal_moves:
                     best_san = bd.san(bm)
             except (chess.InvalidMoveError, ValueError):
                 pass
-        return {
+
+        out = {
             "turn": data.get("turn"),
             "bestmove": best_san or data.get("bestmove"),
             "lines": lines,
         }
+        if applied_san:
+            out["applied_moves"] = applied_san
+        return out
 
     def get_policy(self, fen: str, nodes: int | None = None) -> dict:
         payload: dict = {"fen": fen}

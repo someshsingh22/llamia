@@ -70,13 +70,20 @@ DO NOT call reset_position unless you need a *different* position.
 
 Tools (board is stateful across calls):
 - get_position: FEN, ASCII board, legal moves, history
-- make_move(move): apply UCI (e2e4) or SAN (Nf3) move
+- make_move(move): apply UCI (e2e4) or SAN (Nf3) move PERMANENTLY
 - undo_move: take back last move
 - reset_position(fen): switch to a different FEN
-- analyze(nodes, multipv): engine search — centipawn scores, PV lines
+- analyze(nodes, multipv, moves=[]): engine search. Pass `moves=[X]` to
+  analyze the position AFTER playing X without changing state — use this
+  for "what if?" questions instead of make_move/undo.
 - get_policy(nodes): raw NN priors P and values V per move (fast, 1 pass)
 
-For blunder analysis: try the move → analyze the result → undo → analyze original → explain the refutation. Be efficient with tool calls — each one costs context."""
+Blunder analysis pattern (2 calls):
+  1. analyze() — see the engine's best move + eval for the current position.
+  2. analyze(moves=["<candidate>"]) — see the eval after the candidate move.
+Compare the two evaluations; the difference is the centipawn loss.
+The PV from step 2 starts with the opponent's refutation (in SAN, e.g. Qxg5+).
+"""
 
 # Tool definitions fed to the API (used by vllm to build the chat template's
 # tool list, which teaches the model what functions exist and their parameters).
@@ -127,12 +134,24 @@ TOOL_DEFS = [
         "type": "function",
         "function": {
             "name": "analyze",
-            "description": "Run lc0 engine search. Returns best moves with centipawn scores (positive = good for side to move).",
+            "description": (
+                "Run lc0 engine search on the current position, optionally AFTER "
+                "applying a sequence of hypothetical moves (does NOT mutate state). "
+                "Returns top moves with centipawn scores (positive = good for side to move) "
+                "and SAN principal variations. "
+                "Use `moves` to explore variations cheaply: e.g. analyze(moves=['Nxd4']) "
+                "returns the engine view after Nxd4 in ONE call — no make_move/undo needed."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "nodes": {"type": "integer", "description": "Search budget (default 800)"},
                     "multipv": {"type": "integer", "description": "Top moves to return (default 3)"},
+                    "moves": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional UCI/SAN moves to apply before analyzing. State is unchanged.",
+                    },
                 },
                 "required": [],
             },
@@ -193,6 +212,7 @@ class ChessAnalyst:
                 self.state.fen,
                 nodes=int(args.get("nodes", 800)),
                 multipv=int(args.get("multipv", 3)),
+                moves=args.get("moves"),
             )
         if name == "get_policy":
             nodes = args.get("nodes")
