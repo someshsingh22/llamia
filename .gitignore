@@ -1,2 +1,16 @@
 .claude/
 .remember/
+CLAUDE.md
+
+# Python / uv environments
+.venv/
+__pycache__/
+*.pyc
+
+# Engine weights (large; fetched on demand)
+lc0_server/weights/*.pb.gz
+
+# logs
+*.log
+*.txt
+
