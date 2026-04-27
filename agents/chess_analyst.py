@@ -65,15 +65,18 @@ def _strip_tool_calls(content: str) -> str:
 # Kept tight — 4 k token context window shared with tool outputs & responses.
 SYSTEM_PROMPT = """\
 You are a chess expert with access to lc0, a top neural network engine.
-You maintain a stateful board. Tools available:
-- get_position: current FEN, legal moves, recent history
+A board is already loaded — any FEN in the user's query has been applied for you.
+DO NOT call reset_position unless you need a *different* position.
+
+Tools (board is stateful across calls):
+- get_position: FEN, ASCII board, legal moves, history
 - make_move(move): apply UCI (e2e4) or SAN (Nf3) move
 - undo_move: take back last move
-- reset_position(fen): set board to FEN
+- reset_position(fen): switch to a different FEN
 - analyze(nodes, multipv): engine search — centipawn scores, PV lines
 - get_policy(nodes): raw NN priors P and values V per move (fast, 1 pass)
 
-Workflow for blunder analysis: check position → try the move → analyze → compare alternatives → explain the refutation."""
+For blunder analysis: try the move → analyze the result → undo → analyze original → explain the refutation. Be efficient with tool calls — each one costs context."""
 
 # Tool definitions fed to the API (used by vllm to build the chat template's
 # tool list, which teaches the model what functions exist and their parameters).
@@ -172,6 +175,8 @@ class ChessAnalyst:
         self.client = openai.OpenAI(base_url=llm_base_url, api_key="none")
         self.lc0 = LcOClient(base_url=lc0_url)
         self.state = ChessState(initial_fen or chess.STARTING_FEN)
+        # Per-run telemetry — populated by run()
+        self.last_stats: dict = {}
 
     # ── Tool dispatch ──────────────────────────────────────────────────────────
     def _dispatch(self, name: str, args: dict) -> Any:
@@ -212,7 +217,12 @@ class ChessAnalyst:
             {"role": "user", "content": query},
         ]
 
+        tool_call_count = 0
+        llm_round_count = 0
+        tool_breakdown: dict[str, int] = {}
+
         for round_idx in range(MAX_ROUNDS):
+            llm_round_count += 1
             resp = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
@@ -243,6 +253,12 @@ class ChessAnalyst:
 
             # No tool calls → final answer
             if not tool_calls:
+                self.last_stats = {
+                    "llm_rounds": llm_round_count,
+                    "tool_calls": tool_call_count,
+                    "tool_breakdown": tool_breakdown,
+                    "forced": False,
+                }
                 if verbose:
                     print(f"\n{'─'*60}\n[Answer]\n{visible_text or raw_content}\n")
                 return visible_text or raw_content
@@ -251,6 +267,8 @@ class ChessAnalyst:
             for call in tool_calls:
                 name = call["name"]
                 args = call["arguments"]
+                tool_call_count += 1
+                tool_breakdown[name] = tool_breakdown.get(name, 0) + 1
 
                 if verbose:
                     arg_str = ", ".join(f"{k}={v!r}" for k, v in args.items())
@@ -286,6 +304,12 @@ class ChessAnalyst:
             extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
         final = _strip_tool_calls(resp.choices[0].message.content or "")
+        self.last_stats = {
+            "llm_rounds": llm_round_count + 1,
+            "tool_calls": tool_call_count,
+            "tool_breakdown": tool_breakdown,
+            "forced": True,
+        }
         if verbose:
             print(f"\n{'─'*60}\n[Answer]\n{final}\n")
         return final

@@ -58,6 +58,7 @@ class ChessState:
         legal = sorted(b.san(m) for m in b.legal_moves)
         return {
             "fen": b.fen(),
+            "ascii_board": str(b),  # 8x8 grid, white pieces uppercase, black lowercase
             "turn": "white" if b.turn == chess.WHITE else "black",
             "move_number": b.fullmove_number,
             "in_check": b.is_check(),

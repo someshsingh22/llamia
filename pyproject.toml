@@ -26,3 +26,8 @@ explicit = true
 torch = [{ index = "pytorch-cu126" }]
 torchvision = [{ index = "pytorch-cu126" }]
 torchaudio = [{ index = "pytorch-cu126" }]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
