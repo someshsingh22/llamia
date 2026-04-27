@@ -206,6 +206,15 @@ class ChessAnalyst:
         if name == "undo_move":
             return self.state.undo_move()
         if name == "reset_position":
+            if getattr(self, "_reset_locked", False):
+                return {
+                    "noop": True,
+                    "message": (
+                        "The board is already loaded with the FEN from the user's "
+                        "query. No need to reset. Proceed directly to analysis."
+                    ),
+                    "current_fen": self.state.fen,
+                }
             return self.state.reset(args.get("fen", ""))
         if name == "analyze":
             return self.lc0.analyze(
@@ -225,12 +234,24 @@ class ChessAnalyst:
     # ── Agent loop ─────────────────────────────────────────────────────────────
     def run(self, query: str, verbose: bool = True) -> str:
         # Auto-detect and load FEN embedded in the query
+        fen_loaded = False
         fen_match = _FEN_RE.search(query)
         if fen_match:
             fen = fen_match.group(0)
             r = self.state.reset(fen)
-            if "error" not in r and verbose:
-                print(f"[Board] Position set: {fen}\n")
+            if "error" not in r:
+                fen_loaded = True
+                if verbose:
+                    print(f"[Board] Position set: {fen}\n")
+
+        # Drop reset_position from the tool list when we already loaded a FEN.
+        # Without it in the tool catalogue the model is far less likely to
+        # propose it, and if it does (from training prior), the dispatcher
+        # rejects it with a clear message instead of silently succeeding.
+        active_tools = TOOL_DEFS if not fen_loaded else [
+            t for t in TOOL_DEFS if t["function"]["name"] != "reset_position"
+        ]
+        self._reset_locked = fen_loaded  # checked in _dispatch
 
         messages: list[dict] = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -246,7 +267,7 @@ class ChessAnalyst:
             resp = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                tools=TOOL_DEFS,
+                tools=active_tools,
                 tool_choice="auto",
                 max_tokens=700,
                 temperature=0.0,
