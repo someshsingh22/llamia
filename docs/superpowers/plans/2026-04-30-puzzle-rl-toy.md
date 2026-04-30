@@ -9,7 +9,7 @@
 - Rollout: VERL `tool_agent_loop` (multi-turn, async, vllm-backed). Tools are `analyze`, `get_policy`, `get_position`, `make_move`, `undo_move` — exposed as `verl.tools.BaseTool` subclasses wrapping the existing `agents/tools.py` `LcOClient`.
 - Reward: `format × (½·R_pop + ½·R_elo)` where `R_x = max(0, 1 − |err_x|/scale_x)`. Format is binary on parsing the final answer with regex `popularity .* (-?\d+).* ELO .* (\d+)`.
 - Algorithm: GRPO with DAPO knobs preset (Clip-Higher ε=(0.2, 0.28), Token-Level Loss, Overlong Soft Penalty, Dynamic Sampling, β_KL=1e-3 with 100-step ref refresh). Group size G=8, T=1.0 rollout. Loss is masked on tool/observation tokens (verl default for tool_agent_loop). `enable_thinking=False` to dodge the Qwen3 "plans tool but never emits" failure mode.
-- GPU layout: lc0 on GPUs 0–3 (ports 7100–7103), VERL training on GPUs 4–7. The vllm rollout server stays on its current 8-GPU pool on port 7000 — VERL will use it via the rollout-server pathway, not co-trained on the same GPUs as lc0.
+- GPU layout: **all three workloads share GPUs 0–7.** lc0 holds ~3 GB per GPU (noise on 80 GB A100s). VERL training (FSDP-sharded actor + ref + optimizer + internal rollout vllm) takes the rest. The external vllm currently running on port 7000 (~73 GB/GPU) is **stopped during training** — it only exists to serve the inference-time chess analyst smoke test (Task 3), not training. VERL spawns its own rollout vllm across all 8 GPUs at `gpu_memory_utilization=0.5`, leaving room for FSDP weights and activations.
 
 **Tech Stack:** VERL 0.7.1, vLLM 0.14.0, Qwen3.5-4B, lc0 0.32.1 BT4, PyArrow/Parquet, HuggingFace `datasets`, FastAPI lc0 wrapper.
 
@@ -31,7 +31,6 @@
 | `agents/verl_tools.py` | `LcoAnalyzeTool`, `LcoPolicyTool`, `GetPositionTool`, `MakeMoveTool`, `UndoMoveTool` — `verl.tools.BaseTool` subclasses sharing one `ChessState` per trajectory | new |
 | `agents/verl_tool_config.yaml` | VERL tool registry pointing to the classes above | new |
 | `scripts/test_rollout.py` | smoke test: runs N puzzles through `ChessAnalyst`, parses, scores, prints stats | new |
-| `scripts/disaggregate_lc0.sh` | restart lc0 pool on GPUs 0–3 only | new |
 | `configs/qwen3_puzzle_grpo.yaml` | VERL config for the toy task (DAPO knobs, custom reward, agent loop, ground-truth columns) | new |
 | `scripts/train_puzzle_grpo.sh` | wrapper invoking `verl.trainer.main_ppo` | new |
 | `CLAUDE.md` | add "RL Training" section pointing at `rl_recipes.md` + new artifacts | modify |
@@ -611,86 +610,48 @@ $SUMMARY"
 
 ---
 
-## Task 4: GPU disaggregation
+## Task 4: Free GPU memory for training
 
-**Files:**
-- Create: `scripts/disaggregate_lc0.sh`
+lc0 stays on all 8 GPUs (3 GB/GPU is noise on 80 GB A100s). The real contention is between the **external vllm at port 7000** (currently `gpu_memory_utilization=0.92` ≈ 73 GB/GPU) and **VERL's training process** (FSDP weights + optimizer + activations + its own internal rollout vllm). The external vllm only exists to serve the inference-time chess analyst smoke test from Task 3 — it is not used during training. We stop it before training and let VERL claim the freed memory.
 
-Per `rl_recipes.md` §7: do not co-locate inference and training on the same GPUs at scale. lc0 currently runs on GPUs 0–7 (8-server pool), and VERL training will also want all 8. We move lc0 to GPUs 0–3 (ports 7100–7103) and reserve GPUs 4–7 for VERL.
-
-- [ ] **Step 4.1: Write the disaggregation script**
-
-Create `scripts/disaggregate_lc0.sh`:
+- [ ] **Step 4.1: Confirm the external vllm process is identifiable**
 
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
-# Restart lc0 pool on GPUs 0-3 only (ports 7100-7103),
-# leaving GPUs 4-7 free for VERL training.
-cd "$(dirname "$0")/.."
+pgrep -fa "vllm serve Qwen/Qwen3.5-4B" || echo "no external vllm running"
+nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv
+```
 
-# Kill existing lc0 servers
-pkill -f "lc0_server" || true
-sleep 2
+Note the PID(s). Expected: ~74 GB used per GPU (vllm 73 + lc0 3 ≈ 76, the rest is reserve).
 
-# Start 4 servers on GPUs 0-3
-N_GPUS=4 BASE_PORT=7100 LOG_DIR=/tmp \
-  ./lc0_server/scripts/start_lc0_servers.sh
+- [ ] **Step 4.2: Stop the external vllm**
 
-# Health-check
-for p in 7100 7101 7102 7103; do
-  for _ in {1..30}; do
-    if curl -sf "http://localhost:$p/health" >/dev/null; then
-      echo "  port $p OK"
-      break
-    fi
-    sleep 1
-  done
+```bash
+pkill -f "vllm serve Qwen/Qwen3.5-4B" || true
+# wait for memory to actually free
+for _ in {1..30}; do
+  free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -1)
+  [ "$free" -gt 70000 ] && break
+  sleep 1
 done
-echo "lc0 disaggregated to GPUs 0-3 (ports 7100-7103)"
+nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv
 ```
 
-- [ ] **Step 4.2: Run it and verify**
+Expected: per-GPU `memory.used` drops to ~3 GB (lc0 only), `memory.free` rises to ~77 GB.
+
+- [ ] **Step 4.3: Health-check lc0 still works**
 
 ```bash
-chmod +x /dev/shm/somesh/llamia/scripts/disaggregate_lc0.sh
-/dev/shm/somesh/llamia/scripts/disaggregate_lc0.sh
-nvidia-smi --query-gpu=index,memory.used --format=csv | head -10
+for p in 7100 7101 7102 7103 7104 7105 7106 7107; do
+  printf "%s " "$p"; curl -sf "http://localhost:$p/health" || echo MISSING
+done
+echo
 ```
 
-Expected: GPUs 0–3 show ~3 GB used (lc0 + vllm shard); GPUs 4–7 show vllm shard only. All 4 health checks pass.
+Expected: all 8 ports respond OK. lc0 was untouched; this is just a sanity check.
 
-- [ ] **Step 4.3: Re-run the rollout smoke test against the 4-server pool**
+- [ ] **Step 4.4: Note the restart command**
 
-```bash
-cd /dev/shm/somesh/llamia && python -m scripts.test_rollout -n 10 \
-  --lc0-urls http://localhost:7100 http://localhost:7101 \
-             http://localhost:7102 http://localhost:7103
-```
-
-Expected: comparable format-pass rate and mean reward as Task 3.2. Wall time may rise ~2× (half the lc0 capacity); acceptable.
-
-- [ ] **Step 4.4: Update `agents/chess_analyst.py` default pool**
-
-Edit `agents/chess_analyst.py` line 188:
-
-Before:
-```python
-_DEFAULT_LC0_POOL = [f"http://localhost:{7100 + i}" for i in range(8)]
-```
-
-After:
-```python
-_DEFAULT_LC0_POOL = [f"http://localhost:{7100 + i}" for i in range(4)]
-```
-
-- [ ] **Step 4.5: Commit**
-
-```bash
-cd /dev/shm/somesh/llamia
-git add scripts/disaggregate_lc0.sh agents/chess_analyst.py
-git commit -m "infra: run lc0 on GPUs 0-3 only; reserve 4-7 for VERL training"
-```
+When the training run finishes, restore the external vllm with the command from `CLAUDE.md` (the `nohup vllm serve ...` block) so the chess analyst can be used for inference again. No commit needed for this task — it's a one-shot operational step.
 
 ---
 
@@ -935,7 +896,7 @@ actor_rollout_ref:
     name: vllm
     mode: async
     nnodes: 1
-    n_gpus_per_node: 4               # GPUs 4-7 (set via CUDA_VISIBLE_DEVICES in the launch script)
+    n_gpus_per_node: 8               # all 8 GPUs; lc0 co-resident at ~3 GB/GPU
     temperature: 1.0                 # rl_recipes §5: T=1.0 early; anneal later
     top_p: 0.95
     top_k: 20
@@ -943,7 +904,7 @@ actor_rollout_ref:
     prompt_length: 1024
     max_model_len: 8000
     max_num_batched_tokens: 16384
-    gpu_memory_utilization: 0.85
+    gpu_memory_utilization: 0.5      # leave ~40 GB/GPU for FSDP weights, optimizer, activations
     enable_prefix_caching: True
     tensor_model_parallel_size: 1
     dtype: bfloat16
@@ -953,7 +914,7 @@ actor_rollout_ref:
         tool_call_parser: hermes
         enable_auto_tool_choice: True
     # ── Multi-turn agent loop with our lc0 tools ──
-    agent:
+      agent:
       agent_loop_name: tool_agent
       tool_config_path: agents/verl_tool_config.yaml
       max_turns: 8                   # cap per rollout (chess_analyst uses 14; tighter for toy)
@@ -1010,7 +971,7 @@ trainer:
   project_name: llamia
   experiment_name: puzzle_grpo_toy
   logger: ["console", "wandb"]
-  n_gpus_per_node: 4
+  n_gpus_per_node: 8
   nnodes: 1
   val_before_train: True
   val_freq: 25
@@ -1051,10 +1012,12 @@ Create `scripts/train_puzzle_grpo.sh`:
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# Pin training to GPUs 4-7 (lc0 owns 0-3 after disaggregate_lc0.sh)
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
-export VLLM_HOST="${VLLM_HOST:-localhost}"
-export VLLM_PORT="${VLLM_PORT:-7000}"
+# All 8 GPUs are shared with lc0 (3 GB/GPU). Stop the external vllm first
+# (it's only used by the inference-time chess analyst, not training).
+if pgrep -f "vllm serve Qwen/Qwen3.5-4B" >/dev/null; then
+  echo "ERROR: external vllm still running on port 7000 — run Task 4 (kill it) first" >&2
+  exit 1
+fi
 
 source .venv/bin/activate
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
@@ -1062,7 +1025,6 @@ export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 python -m verl.trainer.main_ppo \
   --config-path "$PWD/configs" \
   --config-name qwen3_puzzle_grpo \
-  trainer.n_gpus_per_node=4 \
   "$@"
 ```
 
@@ -1085,7 +1047,7 @@ cd /dev/shm/somesh/llamia
 - **OOM**: drop `gpu_memory_utilization` to 0.7 and `response_length` to 2048 first; if still OOM, drop `train_batch_size` to 8.
 - **Config error on a DAPO knob**: revisit Step 6.2; either rename to the verl 0.7.1 equivalent or remove the unsupported knob and note it in CLAUDE.md as deferred.
 - **Reward mean exactly 0.0 every step**: format collapse. Open `/tmp/puzzle_grpo_smoke.log`, find a sample rollout, verify the parser. If the model never emits the answer line under VERL's chat template (different from the standalone analyst), this is the Qwen3 thinking-mode "plans tool but never emits" failure (rl_recipes §4) — confirm `enable_thinking: False` is actually being applied in the rollout config.
-- **Rollout step hangs > 5 min**: lc0 tool deadlock. Check `nvidia-smi` for GPUs 0–3; tail `/tmp/lc0_*.log`.
+- **Rollout step hangs > 5 min**: lc0 tool deadlock. Check `nvidia-smi`; tail `/tmp/lc0_*.log`.
 
 - [ ] **Step 6.5: Commit**
 
@@ -1095,7 +1057,7 @@ git commit -m "configs: GRPO+DAPO toy training for puzzle popularity+ELO
 
 Per rl_recipes.md: Clip-Higher (0.2, 0.28), Token-Level Loss, Overlong
 penalty, Dynamic Sampling, group_size=8, T=1.0, β_KL=1e-3 + ref refresh.
-GPUs 4-7 for training; lc0 disaggregated to 0-3."
+All 8 GPUs shared with lc0; external vllm stopped before training."
 ```
 
 ---
@@ -1119,13 +1081,13 @@ End-to-end GRPO+DAPO loop on a single LLAMIA-Bench dimension. Pipeline:
 # 1. Build dataset (one-off)
 python -m data.prepare_puzzles --train-limit 4000 --val-limit 400
 
-# 2. Disaggregate lc0 onto GPUs 0-3 (one-off per session)
-./scripts/disaggregate_lc0.sh
-
-# 3. Smoke-test rollouts (sanity check; format-pass rate ≥ 50% expected)
+# 2. Smoke-test rollouts against the running external vllm (≥ 50% format-pass)
 python -m scripts.test_rollout -n 20
 
-# 4. Toy training run on GPUs 4-7
+# 3. Stop external vllm (frees ~73 GB/GPU for VERL training; lc0 stays up)
+pkill -f "vllm serve Qwen/Qwen3.5-4B"
+
+# 4. Toy training run on all 8 GPUs (lc0 co-resident at 3 GB/GPU)
 ./scripts/train_puzzle_grpo.sh trainer.total_training_steps=100
 ```
 
@@ -1180,7 +1142,7 @@ Done after the plan was drafted:
 3. **Best-practices baked in** (per user request to derive from `rl_recipes.md`):
    - DAPO knob preset (Clip-Higher 0.2/0.28, Token-Level Loss, Overlong soft penalty, Dynamic Sampling, β_KL=1e-3 + ref refresh).
    - Multiplicative format×outcome reward, no per-call tool bonuses (avoids stuffing).
-   - GPU disaggregation (lc0 0–3, training 4–7).
+   - lc0 stays on all 8 GPUs (3 GB/GPU is noise on 80 GB A100s); external vllm stopped during training, VERL claims the freed memory at `gpu_memory_utilization=0.5`.
    - `enable_thinking=False` to dodge the Qwen3 plans-but-no-tool quirk.
    - T=1.0 rollout, group size 8, max 8 turns, max 4096 response tokens.
    - Format-pass-rate gate before committing to RL (Task 3 decision point) — explicit cold-start escape hatch.
