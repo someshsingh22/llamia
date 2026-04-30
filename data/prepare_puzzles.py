@@ -17,7 +17,7 @@ from typing import Iterable
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-GOLD_RE = re.compile(r"popularity is (-?\d+) and the ELO is (\d+)")
+GOLD_RE = re.compile(r"popularity is (-?\d+) and the ELO is (\d+)\b")
 
 SYSTEM_PROMPT = (
     "You are a chess expert with access to lc0, a top neural network engine.\n"
@@ -76,13 +76,10 @@ def build_rows(raw: Iterable[dict]) -> list[dict]:
     return rows
 
 
-def _stream_split(split: str, limit: int | None):
+def _stream_split(split: str):
     from datasets import load_dataset
     ds = load_dataset("ssingh22/llamia-chess-data", "behavioural_cloning", split=split, streaming=True)
-    for i, ex in enumerate(ds):
-        if limit is not None and i >= limit:
-            break
-        yield ex
+    yield from ds
 
 
 def main():
@@ -97,7 +94,17 @@ def main():
         ("train", args.train_limit, "puzzle_train.parquet"),
         ("test", args.val_limit, "puzzle_val.parquet"),
     ]:
-        rows = build_rows(_stream_split(split, limit * 5))  # 5x headroom for filter
+        rows: list[dict] = []
+        for ex in _stream_split(split):
+            built = build_rows([ex])
+            rows.extend(built)
+            if len(rows) >= limit:
+                break
+        if len(rows) < limit:
+            raise RuntimeError(
+                f"{name}: only found {len(rows)} puzzle rows (needed {limit}). "
+                "The split may have fewer type_Puzzle examples than expected."
+            )
         rows = rows[:limit]
         table = pa.Table.from_pylist(rows)
         out = args.out_dir / name

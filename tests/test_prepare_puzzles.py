@@ -1,8 +1,4 @@
 """Smoke-test the puzzle parquet builder on a tiny offline fixture."""
-from pathlib import Path
-
-import pyarrow.parquet as pq
-
 from data.prepare_puzzles import build_rows, GOLD_RE
 
 
@@ -42,4 +38,16 @@ def test_build_rows_extracts_fen_and_targets():
 
 def test_non_puzzle_rows_are_dropped():
     raw = [{"class": "type_CCRL", "state": ["x"], "conversations": []}]
+    assert build_rows(raw) == []
+
+
+def test_puzzle_row_without_popularity_text_is_dropped():
+    raw = [{
+        "class": "type_Puzzle",
+        "state": ["8/8/8/8/8/8/8/k1K5 w - - 0 1"],
+        "conversations": [
+            {"from": "human", "value": "themes?"},
+            {"from": "gpt",   "value": "endgame"},
+        ],
+    }]
     assert build_rows(raw) == []
