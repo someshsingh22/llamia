@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import re
 
-_PATTERN = re.compile(r"popularity\s+is\s+(-?\d+)\s+and\s+the\s+ELO\s+is\s+(\d+)", re.IGNORECASE)
+_PATTERN = re.compile(r"popularity\s+is\s+(-?\d+)\s+and\s+(?:the\s+)?ELO\s+is\s+(\d+)\b", re.IGNORECASE)
 
 
 def parse_popularity_elo(text: str) -> tuple[int | None, int | None]:

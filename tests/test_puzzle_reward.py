@@ -52,6 +52,15 @@ def test_score_partial_credit_on_close_predictions():
     assert math.isclose(s, 0.5, rel_tol=1e-6)
 
 
+def test_parser_accepts_missing_article_before_elo():
+    assert parse_popularity_elo("popularity is 88 and ELO is 1904") == (88, 1904)
+
+
+def test_parser_rejects_sentence_break():
+    # Period after popularity is a format violation per system prompt; must NOT extract.
+    assert parse_popularity_elo("popularity is 88. The ELO is 1904") == (None, None)
+
+
 def test_score_clamps_far_misses_to_zero():
     s = compute_score(
         data_source="x",
