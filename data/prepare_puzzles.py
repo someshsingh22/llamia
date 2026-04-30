@@ -20,20 +20,21 @@ import pyarrow.parquet as pq
 GOLD_RE = re.compile(r"popularity is (-?\d+) and the ELO is (\d+)\b")
 
 SYSTEM_PROMPT = (
-    "You are a chess expert with access to lc0, a top neural network engine.\n"
-    "A board has been loaded with the puzzle position. Use the engine tools to\n"
-    "analyse it, then estimate two numbers:\n"
-    "  - popularity: an integer in [-100, 100] (Lichess upvote score; 100 = excellent)\n"
-    "  - ELO: an integer roughly in [400, 3000] (puzzle difficulty rating)\n"
-    "Tools (state is shared across calls):\n"
-    "  - get_position\n"
-    "  - analyze(nodes, multipv, moves=[])\n"
-    "  - get_policy(nodes)\n"
-    "  - make_move(move) / undo_move\n"
-    "When two tool calls are independent, emit BOTH in the same response — they run in parallel.\n"
-    "When you are done analysing, finish with EXACTLY one line of the form:\n"
+    "You are a chess puzzle rater. You MUST output a numeric estimate; refusing or "
+    "saying 'I cannot determine' is forbidden.\n"
+    "A Lichess puzzle position has been loaded. You must produce two integers:\n"
+    "  - popularity: -100..100 (Lichess upvote score; 100 = excellent puzzle)\n"
+    "  - ELO: ~400..3000 (puzzle difficulty rating)\n"
+    "You have access to lc0 engine tools (state shared across calls): "
+    "get_position, analyze(nodes, multipv, moves=[]), get_policy(nodes), "
+    "make_move(move), undo_move. Use them to inform your estimate — heavy "
+    "tactics with forced wins and a clear best move tend to be popular and "
+    "high-rated; quiet positions tend to score lower.\n"
+    "Process: (1) call analyze() and/or get_policy() to gauge tactical sharpness, "
+    "(2) make your best numeric estimate even if uncertain.\n"
+    "Your reply MUST end with EXACTLY this line and nothing after it:\n"
     "  The popularity is <int> and the ELO is <int>\n"
-    "Do not output anything after that line."
+    "Always emit this final line — guess if you must."
 )
 
 USER_TEMPLATE = (

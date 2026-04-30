@@ -38,14 +38,18 @@ def main():
     for i, row in enumerate(rows):
         fen = row["fen"]
         gt = row["reward_model"]["ground_truth"]
+        # Pull both the system prompt (mandates the answer line) and user
+        # content from the dataset so the smoke test matches what training
+        # rollouts will see.
+        sys_prompt = row["prompt"][0]["content"]
+        user_content = row["prompt"][-1]["content"]
         analyst = ChessAnalyst(
             llm_base_url=args.llm_url,
             model=args.model,
             lc0_url=args.lc0_url,
             initial_fen=fen,
+            system_prompt=sys_prompt,
         )
-        # Use the user prompt from the dataset row directly.
-        user_content = row["prompt"][-1]["content"]
         try:
             answer = analyst.run(user_content, verbose=False)
         except Exception as e:

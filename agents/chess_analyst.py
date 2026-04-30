@@ -189,14 +189,16 @@ class ChessAnalyst:
     def __init__(
         self,
         llm_base_url: str = "http://localhost:7000/v1",
-        model: str = "Qwen/Qwen3.5-122B-A10B-FP8",
+        model: str = "Qwen/Qwen3-4B",
         lc0_url: str = "http://localhost:7100",
         initial_fen: str | None = None,
+        system_prompt: str | None = None,
     ):
         self.model = model
         self.client = openai.OpenAI(base_url=llm_base_url, api_key="none")
         self.lc0 = LcOClient(base_url=lc0_url)
         self.state = ChessState(initial_fen or chess.STARTING_FEN)
+        self.system_prompt = system_prompt or SYSTEM_PROMPT
         # Per-run telemetry — populated by run()
         self.last_stats: dict = {}
 
@@ -257,7 +259,7 @@ class ChessAnalyst:
         self._reset_locked = fen_loaded  # checked in _dispatch
 
         messages: list[dict] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": query},
         ]
 
@@ -284,16 +286,45 @@ class ChessAnalyst:
             if thinking and verbose:
                 print(f"[Thinking] {thinking[:400]}{'…' if len(thinking) > 400 else ''}\n")
 
-            # ── Parse Qwen3.5 tool calls from content ──────────────────────
-            tool_calls = _parse_qwen_tool_calls(raw_content)
-            visible_text = _strip_tool_calls(raw_content)
+            # ── Tool calls: standard OpenAI field first (Qwen3 + hermes parser),
+            #    falling back to Qwen3.5 inline XML in content.
+            tool_calls: list[dict] = []
+            if choice.message.tool_calls:
+                for tc in choice.message.tool_calls:
+                    try:
+                        args = json.loads(tc.function.arguments or "{}")
+                    except (json.JSONDecodeError, ValueError):
+                        args = {}
+                    tool_calls.append({"name": tc.function.name, "arguments": args})
+                visible_text = raw_content.strip()
+            else:
+                tool_calls = _parse_qwen_tool_calls(raw_content)
+                visible_text = _strip_tool_calls(raw_content)
 
             if visible_text and verbose:
                 print(f"[LLM] {visible_text}\n")
 
-            # Append assistant turn (raw content preserved so the model sees
-            # its own output correctly in subsequent turns)
-            messages.append({"role": "assistant", "content": raw_content})
+            # Append assistant turn. With OpenAI-format tool calls we must
+            # echo them back as `tool_calls` (each paired with a tool_call_id)
+            # so the chat template can match the subsequent role=tool replies.
+            assistant_msg: dict = {"role": "assistant", "content": raw_content or ""}
+            if choice.message.tool_calls:
+                assistant_msg["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in choice.message.tool_calls
+                ]
+            messages.append(assistant_msg)
+            _openai_tc_ids = (
+                [tc.id for tc in choice.message.tool_calls]
+                if choice.message.tool_calls else None
+            )
 
             # No tool calls → final answer
             if not tool_calls:
@@ -337,7 +368,7 @@ class ChessAnalyst:
             order_idx = {id(c): i for i, c in enumerate(tool_calls)}
             results.sort(key=lambda pair: order_idx[id(pair[0])])
 
-            for call, result in results:
+            for idx, (call, result) in enumerate(results):
                 name = call["name"]
                 args = call["arguments"]
                 tool_call_count += 1
@@ -350,12 +381,10 @@ class ChessAnalyst:
                     preview = rs[:500] + ("…" if len(rs) > 500 else "")
                     print(f"     → {preview}\n")
 
-                # Return tool results in standard OpenAI format; vllm / the
-                # Qwen chat template will format them correctly for the next turn.
-                messages.append({
-                    "role": "tool",
-                    "content": json.dumps(result),
-                })
+                tool_msg: dict = {"role": "tool", "content": json.dumps(result)}
+                if _openai_tc_ids and idx < len(_openai_tc_ids):
+                    tool_msg["tool_call_id"] = _openai_tc_ids[idx]
+                messages.append(tool_msg)
 
         # Fallback: all tool call rounds spent — explicitly ask for the answer.
         messages.append({
