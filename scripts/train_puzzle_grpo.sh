@@ -21,6 +21,7 @@ fi
 
 source .venv/bin/activate
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
+export HF_HUB_OFFLINE=1
 
 CKPT_BASE="checkpoints/puzzle_grpo_toy"
 PUZZLE_N_TRAIN="${PUZZLE_N_TRAIN:-4000}"

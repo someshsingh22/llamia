@@ -17,10 +17,10 @@ actor_rollout_ref:
     optim:
       lr: 1e-6
       lr_warmup_steps_ratio: 0.05
-    ppo_mini_batch_size: 32
+    ppo_mini_batch_size: 16
     ppo_micro_batch_size_per_gpu: 1
     use_dynamic_bsz: true
-    ppo_max_token_len_per_gpu: 8192
+    ppo_max_token_len_per_gpu: 6144
     # DAPO Token-Level Policy Gradient Loss (verified knob name)
     loss_agg_mode: token-mean
     # DAPO Clip-Higher: ε_low=0.2, ε_high=0.28 (clip_ratio_low/high verified)
@@ -30,15 +30,17 @@ actor_rollout_ref:
     # Defends against entropy collapse after Clip-Higher; 0.001 is the conservative start.
     entropy_coeff: 0.001
     fsdp_config:
-      param_offload: false
-      optimizer_offload: false
+      param_offload: true
+      optimizer_offload: true
       fsdp_size: -1
 
   rollout:
     name: vllm
     mode: async
     # n = GRPO group size G. actor.rollout_n mirrors this value.
-    n: 8
+    # n=4: 16 prompts × 4 = 64 trajectories on GPU (~14 GiB buffer at 5120 pad, 8 fields).
+    # train_batch_size=32 OOMed regardless of n (training floor 60.77 GiB too high).
+    n: 4
     nnodes: 1
     n_gpus_per_node: 8          # all 8 GPUs; lc0 co-resident at ~3 GB/GPU
     temperature: 1.0            # T=1.0 for RL rollouts
@@ -46,9 +48,13 @@ actor_rollout_ref:
     top_k: 20
     response_length: 4096
     prompt_length: 1024
-    max_model_len: 8000
-    max_num_batched_tokens: 16384
-    gpu_memory_utilization: 0.5  # ~40 GB/GPU for FSDP, rest for rollout vllm
+    max_model_len: 5500
+    max_num_batched_tokens: 8192
+    # vLLM 0.14.0: cuMemRelease bug (issue #25171) is fixed (was broken in 0.10.2).
+    # free_cache_engine=true sleeps vLLM during FSDP backward, releasing KV cache
+    # (~15.5 GB at gmu=0.35) so the 9.27 GB FSDP all-gather has ~12 GB headroom.
+    gpu_memory_utilization: 0.35
+    free_cache_engine: true
     enable_prefix_caching: true
     tensor_model_parallel_size: 1
     dtype: bfloat16
@@ -100,8 +106,10 @@ data:
   reward_fn_key: data_source
   max_prompt_length: 1024
   max_response_length: 4096
-  # train_batch_size = num_unique_prompts × rollout.n = 8 prompts × 8 = 64
-  train_batch_size: 64
+  # train_batch_size = num_unique_prompts. Total trajectories = train_batch_size × rollout.n
+  # = 16 × 4 = 64 trajectories on GPU. 32 OOMed: training(60.77)+vLLM(8.73)+lc0(2.91)=72.41 GiB,
+  # only 6.84 GiB free vs 9.27 GiB needed for FSDP all-gather during backward.
+  train_batch_size: 16
   val_batch_size: 64
   return_raw_chat: true
   # Qwen3: disable <think> block during RL rollouts to avoid the

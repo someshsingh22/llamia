@@ -32,3 +32,5 @@ lc0_server/weights/*.pb.gz
 *.log
 *.txt
 
+wandb/
+verl*/
