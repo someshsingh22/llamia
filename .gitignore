@@ -1,6 +1,7 @@
 .claude/
 .remember/
-CLAUDE.md
+*.md
+.env
 
 # Python / uv environments
 .venv/
