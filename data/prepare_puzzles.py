@@ -4,8 +4,9 @@ The canonical processed dataset lives on Hugging Face:
 
     ssingh22/llamia-verl-data / puzzle_popularity_elo
 
-with splits ``train`` and ``test``.  The processed ``train`` split contains all
-raw train puzzles, while ``test`` is a fixed seeded sample from raw test.  This
+with splits ``train`` and ``test``.  The processed splits are bounded seeded
+ELO-stratified samples from bounded candidate pools over the raw Hugging Face
+splits, so publishing does not scan the full 18M-example raw training set.  This
 module can rebuild and publish that dataset from ``ssingh22/llamia-chess-data``
 and can materialize sampled parquet files when VERL requires local paths.
 """
@@ -29,8 +30,12 @@ RAW_CONFIG_NAME = "behavioural_cloning"
 PROCESSED_DATASET_ID = "ssingh22/llamia-verl-data"
 PROCESSED_CONFIG_NAME = "puzzle_popularity_elo"
 PROCESSED_CACHE_DIR = Path(".cache/llamia_verl_data") / PROCESSED_CONFIG_NAME
+DEFAULT_TRAIN_SIZE = 4000
 DEFAULT_TEST_SIZE = 1000
 DEFAULT_SAMPLE_SEED = 42
+DEFAULT_SHUFFLE_BUFFER_SIZE = 10000
+DEFAULT_CANDIDATE_MULTIPLIER = 5
+ELO_BUCKET_EDGES = [1000, 1400, 1800, 2200, 2600]
 
 GOLD_RE = re.compile(r"popularity is (-?\d+) and the ELO is (\d+)\b")
 
@@ -110,6 +115,50 @@ def build_rows(raw: Iterable[dict], split: str = "all") -> list[dict]:
     return rows
 
 
+def collect_puzzle_rows(raw: Iterable[dict], split: str, n_samples: int) -> list[dict]:
+    """Collect the first ``n_samples`` valid puzzle rows from an iterable.
+
+    Args:
+        raw: Raw examples, ideally already shuffled by the caller.
+        split: Processed split name for ``data_source``.
+        n_samples: Number of puzzle rows to collect.
+
+    Returns:
+        The collected processed rows.
+    """
+    if n_samples < 0:
+        raise ValueError("n_samples must be non-negative")
+    rows: list[dict] = []
+    for ex in raw:
+        rows.extend(build_rows([ex], split=split))
+        if len(rows) >= n_samples:
+            return rows[:n_samples]
+    raise ValueError(f"only found {len(rows)} puzzle rows for split={split}; needed {n_samples}")
+
+
+def collect_candidate_puzzle_rows(
+    raw: Iterable[dict],
+    split: str,
+    n_samples: int,
+    candidate_multiplier: int = DEFAULT_CANDIDATE_MULTIPLIER,
+) -> list[dict]:
+    """Collect a bounded candidate pool for stratified sampling.
+
+    Args:
+        raw: Raw examples, ideally already shuffled by the caller.
+        split: Processed split name for ``data_source``.
+        n_samples: Final target sample count.
+        candidate_multiplier: Number of candidates to collect per final row.
+
+    Returns:
+        A candidate pool of processed puzzle rows.
+    """
+    if candidate_multiplier < 1:
+        raise ValueError("candidate_multiplier must be at least 1")
+    target = n_samples * candidate_multiplier
+    return collect_puzzle_rows(raw, split=split, n_samples=target)
+
+
 def sample_rows(rows: list[dict], n_samples: int | None, seed: int) -> list[dict]:
     """Sample rows deterministically without modifying row contents.
 
@@ -129,6 +178,57 @@ def sample_rows(rows: list[dict], n_samples: int | None, seed: int) -> list[dict
         raise ValueError(f"requested {n_samples} rows, but only {len(rows)} are available")
     indices = random.Random(seed).sample(range(len(rows)), n_samples)
     return [rows[index] for index in indices]
+
+
+def _elo_bucket(row: dict, bucket_edges: list[int]) -> int:
+    elo = int(row["reward_model"]["ground_truth"]["elo"])
+    for index, edge in enumerate(bucket_edges):
+        if elo < edge:
+            return index
+    return len(bucket_edges)
+
+
+def stratified_sample_rows(
+    rows: list[dict],
+    n_samples: int,
+    seed: int,
+    bucket_edges: list[int] | None = None,
+) -> list[dict]:
+    """Sample rows round-robin across ELO/difficulty buckets.
+
+    Args:
+        rows: Candidate processed rows.
+        n_samples: Number of rows to sample.
+        seed: RNG seed used to shuffle rows within each bucket.
+        bucket_edges: ELO bucket boundaries. Defaults cover low to very hard
+            Lichess puzzle ratings.
+
+    Returns:
+        A deterministic sample with broad ELO coverage when candidates allow it.
+    """
+    if n_samples < 0:
+        raise ValueError("n_samples must be non-negative")
+    if n_samples > len(rows):
+        raise ValueError(f"requested {n_samples} rows, but only {len(rows)} are available")
+    edges = bucket_edges or ELO_BUCKET_EDGES
+    rng = random.Random(seed)
+    buckets: dict[int, list[dict]] = {idx: [] for idx in range(len(edges) + 1)}
+    for row in rows:
+        buckets[_elo_bucket(row, edges)].append(row)
+    for bucket_rows in buckets.values():
+        rng.shuffle(bucket_rows)
+
+    sampled: list[dict] = []
+    while len(sampled) < n_samples:
+        before = len(sampled)
+        for bucket_index in sorted(buckets):
+            if buckets[bucket_index]:
+                sampled.append(buckets[bucket_index].pop())
+                if len(sampled) == n_samples:
+                    break
+        if len(sampled) == before:
+            break
+    return sampled
 
 
 def build_split_rows(
@@ -167,38 +267,96 @@ def write_parquet_rows(rows: list[dict], out_path: Path) -> Path:
     return out_path
 
 
-def load_raw_split(split: str, dataset_id: str = RAW_DATASET_ID, config_name: str = RAW_CONFIG_NAME):
+def load_raw_split(
+    split: str,
+    dataset_id: str = RAW_DATASET_ID,
+    config_name: str = RAW_CONFIG_NAME,
+    streaming: bool = False,
+):
     """Load one raw split from the upstream HF dataset."""
     from datasets import load_dataset
 
     load_dotenv(REPO_ROOT / ".env")
-    return load_dataset(dataset_id, config_name, split=split)
+    return load_dataset(dataset_id, config_name, split=split, streaming=streaming)
+
+
+def load_shuffled_raw_split(
+    split: str,
+    dataset_id: str = RAW_DATASET_ID,
+    config_name: str = RAW_CONFIG_NAME,
+    seed: int = DEFAULT_SAMPLE_SEED,
+    buffer_size: int = DEFAULT_SHUFFLE_BUFFER_SIZE,
+):
+    """Load a shuffled streaming raw split from Hugging Face."""
+    ds = load_raw_split(split, dataset_id=dataset_id, config_name=config_name, streaming=True)
+    return ds.shuffle(seed=seed, buffer_size=buffer_size)
 
 
 def build_hf_dataset_dict(
     raw_dataset_id: str = RAW_DATASET_ID,
     raw_config_name: str = RAW_CONFIG_NAME,
+    n_train: int = DEFAULT_TRAIN_SIZE,
     n_test: int = DEFAULT_TEST_SIZE,
-    test_seed: int = DEFAULT_SAMPLE_SEED,
+    seed: int = DEFAULT_SAMPLE_SEED,
+    shuffle_buffer_size: int = DEFAULT_SHUFFLE_BUFFER_SIZE,
+    candidate_multiplier: int = DEFAULT_CANDIDATE_MULTIPLIER,
 ):
     """Build the processed Hugging Face ``DatasetDict``.
 
     Args:
         raw_dataset_id: Source dataset repository id.
         raw_config_name: Source dataset config/subset.
+        n_train: Number of train examples to publish.
         n_test: Number of fixed test examples to publish.
-        test_seed: Seed for selecting the fixed processed test set.
+        seed: Seed for selecting processed examples.
+        shuffle_buffer_size: Streaming shuffle buffer size.
+        candidate_multiplier: Number of candidate puzzle rows to gather per
+            published row before ELO-stratified sampling.
 
     Returns:
         A ``DatasetDict`` with ``train`` and ``test`` splits.
     """
     from datasets import Dataset, DatasetDict
 
-    raw_by_split = {
-        "train": load_raw_split("train", raw_dataset_id, raw_config_name),
-        "test": load_raw_split("test", raw_dataset_id, raw_config_name),
-    }
-    split_rows = build_split_rows(raw_by_split, n_test=n_test, test_seed=test_seed)
+    print(
+        f"Collecting {n_train * candidate_multiplier} train candidates "
+        f"for {n_train} ELO-stratified rows..."
+    )
+    train_candidates = collect_candidate_puzzle_rows(
+        load_shuffled_raw_split(
+            "train",
+            dataset_id=raw_dataset_id,
+            config_name=raw_config_name,
+            seed=seed,
+            buffer_size=shuffle_buffer_size,
+        ),
+        split="train",
+        n_samples=n_train,
+        candidate_multiplier=candidate_multiplier,
+    )
+    train_rows = stratified_sample_rows(train_candidates, n_samples=n_train, seed=seed)
+    print(f"Collected {len(train_candidates)} train candidates -> {len(train_rows)} train rows")
+
+    print(
+        f"Collecting {n_test * candidate_multiplier} test candidates "
+        f"for {n_test} ELO-stratified rows..."
+    )
+    test_candidates = collect_candidate_puzzle_rows(
+        load_shuffled_raw_split(
+            "test",
+            dataset_id=raw_dataset_id,
+            config_name=raw_config_name,
+            seed=seed,
+            buffer_size=shuffle_buffer_size,
+        ),
+        split="test",
+        n_samples=n_test,
+        candidate_multiplier=candidate_multiplier,
+    )
+    test_rows = stratified_sample_rows(test_candidates, n_samples=n_test, seed=seed)
+    print(f"Collected {len(test_candidates)} test candidates -> {len(test_rows)} test rows")
+
+    split_rows = {"train": train_rows, "test": test_rows}
     return DatasetDict({
         split: Dataset.from_list(rows)
         for split, rows in split_rows.items()
@@ -210,8 +368,11 @@ def publish_processed_dataset(
     config_name: str = PROCESSED_CONFIG_NAME,
     raw_dataset_id: str = RAW_DATASET_ID,
     raw_config_name: str = RAW_CONFIG_NAME,
+    n_train: int = DEFAULT_TRAIN_SIZE,
     n_test: int = DEFAULT_TEST_SIZE,
-    test_seed: int = DEFAULT_SAMPLE_SEED,
+    seed: int = DEFAULT_SAMPLE_SEED,
+    shuffle_buffer_size: int = DEFAULT_SHUFFLE_BUFFER_SIZE,
+    candidate_multiplier: int = DEFAULT_CANDIDATE_MULTIPLIER,
 ) -> None:
     """Publish the processed dataset to Hugging Face Hub.
 
@@ -220,15 +381,23 @@ def publish_processed_dataset(
         config_name: Destination config/subset name.
         raw_dataset_id: Source HF dataset repository id.
         raw_config_name: Source HF config/subset name.
+        n_train: Number of train examples to publish.
         n_test: Number of fixed test examples to publish.
-        test_seed: Seed for selecting the fixed processed test set.
+        seed: Seed for selecting processed examples.
+        shuffle_buffer_size: Streaming shuffle buffer size.
+        candidate_multiplier: Number of candidate puzzle rows to gather per
+            published row before ELO-stratified sampling.
     """
+    load_dotenv(REPO_ROOT / ".env")
     token = os.environ.get("HF_TOKEN")
     ds = build_hf_dataset_dict(
         raw_dataset_id=raw_dataset_id,
         raw_config_name=raw_config_name,
+        n_train=n_train,
         n_test=n_test,
-        test_seed=test_seed,
+        seed=seed,
+        shuffle_buffer_size=shuffle_buffer_size,
+        candidate_multiplier=candidate_multiplier,
     )
     ds.push_to_hub(dataset_id, config_name=config_name, token=token)
 
@@ -285,8 +454,11 @@ def _parse_args() -> argparse.Namespace:
     publish.add_argument("--config-name", default=PROCESSED_CONFIG_NAME)
     publish.add_argument("--raw-dataset-id", default=RAW_DATASET_ID)
     publish.add_argument("--raw-config-name", default=RAW_CONFIG_NAME)
+    publish.add_argument("--n-train", type=int, default=DEFAULT_TRAIN_SIZE)
     publish.add_argument("--n-test", type=int, default=DEFAULT_TEST_SIZE)
-    publish.add_argument("--test-seed", type=int, default=DEFAULT_SAMPLE_SEED)
+    publish.add_argument("--seed", "--test-seed", dest="seed", type=int, default=DEFAULT_SAMPLE_SEED)
+    publish.add_argument("--shuffle-buffer-size", type=int, default=DEFAULT_SHUFFLE_BUFFER_SIZE)
+    publish.add_argument("--candidate-multiplier", type=int, default=DEFAULT_CANDIDATE_MULTIPLIER)
 
     materialize = subcommands.add_parser("materialize", help="Write a processed HF split to parquet")
     materialize.add_argument("--split", choices=["train", "test"], required=True)
@@ -307,8 +479,11 @@ def main() -> None:
             config_name=args.config_name,
             raw_dataset_id=args.raw_dataset_id,
             raw_config_name=args.raw_config_name,
+            n_train=args.n_train,
             n_test=args.n_test,
-            test_seed=args.test_seed,
+            seed=args.seed,
+            shuffle_buffer_size=args.shuffle_buffer_size,
+            candidate_multiplier=args.candidate_multiplier,
         )
         print(f"Published {args.dataset_id}/{args.config_name}")
         return
