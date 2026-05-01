@@ -13,20 +13,29 @@ from pathlib import Path
 import pyarrow.parquet as pq
 
 from agents.chess_analyst import ChessAnalyst
+from data.prepare_puzzles import DEFAULT_SAMPLE_SEED, PROCESSED_CACHE_DIR, materialize_processed_split
 from rewards.parser import parse_popularity_elo
 from rewards.puzzle_reward import compute_score
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", type=Path, default=Path("data/puzzle_val.parquet"))
+    ap.add_argument("--data", type=Path, default=None)
+    ap.add_argument("--split", choices=["train", "test"], default="test")
+    ap.add_argument("--seed", type=int, default=DEFAULT_SAMPLE_SEED)
     ap.add_argument("-n", type=int, default=20)
     ap.add_argument("--llm-url", default="http://localhost:7000/v1")
     ap.add_argument("--lc0-url", default="http://localhost:7100")
     ap.add_argument("--model", default="Qwen/Qwen3-4B")
     args = ap.parse_args()
 
-    rows = pq.read_table(args.data).to_pylist()[: args.n]
+    data_path = args.data or materialize_processed_split(
+        args.split,
+        out_path=PROCESSED_CACHE_DIR / f"{args.split}.parquet",
+        n_samples=args.n,
+        seed=args.seed,
+    )
+    rows = pq.read_table(data_path).to_pylist()[: args.n]
     print(f"Running {len(rows)} puzzles…\n")
 
     scores: list[float] = []

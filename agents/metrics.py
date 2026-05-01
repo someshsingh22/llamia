@@ -13,7 +13,7 @@ Metric families
 RD note
 -------
 Lichess puzzle ratings carry a Glicko RD (Rating Deviation).  That field is
-not included in puzzle_val.parquet, so we use the test-set standard deviation
+not included in the processed HF test split, so we use the test-set standard deviation
 as a proxy (ELO≈542, Pop≈15.5).  A well-calibrated predictor should achieve
 ≥68 % coverage at 1 RD, ≥95 % at 2 RD.
 """
@@ -25,7 +25,7 @@ from typing import Sequence
 import numpy as np
 from scipy import stats
 
-# ── Reference constants (computed from full puzzle_val.parquet) ───────────────
+# ── Reference constants (computed from processed HF test split) ───────────────
 ELO_RD: float = 542.3   # σ of true ELO — used as RD proxy
 POP_RD: float = 15.5    # σ of true popularity
 

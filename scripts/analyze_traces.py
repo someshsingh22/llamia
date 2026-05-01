@@ -3,7 +3,7 @@
 Usage:
     python scripts/analyze_traces.py                         # default logs/puzzle_traces.jsonl
     python scripts/analyze_traces.py logs/puzzle_traces.jsonl
-    python scripts/analyze_traces.py --split val             # only llamia-puzzle-val records
+    python scripts/analyze_traces.py --split test            # only test-split records
     python scripts/analyze_traces.py --last 1600             # last N trajectories
     python scripts/analyze_traces.py --examples 3            # show N low/high examples
 """
@@ -17,7 +17,7 @@ from pathlib import Path
 
 import numpy as np
 
-VAL_SOURCE = "llamia-puzzle-val"
+VAL_SOURCE = "puzzle_popularity_elo/test"
 
 
 def load(path: Path, last: int | None = None, split: str | None = None) -> list[dict]:
@@ -29,7 +29,7 @@ def load(path: Path, last: int | None = None, split: str | None = None) -> list[
                 continue
             try:
                 r = json.loads(line)
-                if split == "val" and r.get("data_source") != VAL_SOURCE:
+                if split == "test" and r.get("data_source") != VAL_SOURCE:
                     continue
                 if split == "train" and r.get("data_source") == VAL_SOURCE:
                     continue
@@ -76,7 +76,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("path", nargs="?", default="logs/puzzle_traces.jsonl")
     ap.add_argument("--last", type=int, default=None)
-    ap.add_argument("--split", choices=["train", "val"], default=None)
+    ap.add_argument("--split", choices=["train", "test"], default=None)
     ap.add_argument("--examples", type=int, default=2)
     args = ap.parse_args()
 

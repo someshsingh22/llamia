@@ -8,7 +8,7 @@ final answer text.
 
 Usage:
     python scripts/eval_raw.py                      # run all entries in EVAL_CONFIG
-    python scripts/eval_raw.py --n 10               # first 10 val samples
+    python scripts/eval_raw.py --n 10               # seeded sample from processed test split
     python scripts/eval_raw.py --labels gpt-5-low   # run specific label(s)
     python scripts/eval_raw.py --workers 8          # 8 workers → 8 lc0 servers on GPUs 0-7
 """
@@ -34,10 +34,9 @@ try:
 except ImportError:
     pass
 
-import pandas as pd
-
 from agents.chess_analyst import ChessAnalyst
 from agents.metrics import compute_metrics, print_metrics, comparison_table
+from data.prepare_puzzles import DEFAULT_SAMPLE_SEED, load_processed_split, sample_rows
 
 # ── Evaluation configuration ──────────────────────────────────────────────────
 # Edit this dict to add / remove (model, effort) combinations.
@@ -278,19 +277,22 @@ def _parse_args() -> argparse.Namespace:
                    help="Run only these labels from EVAL_CONFIG (default: all)")
     p.add_argument("--parallel-configs", action="store_true",
                    help="Run all configs concurrently (default: sequential)")
+    p.add_argument("--split", choices=["train", "test"], default="test",
+                   help="Processed HF split to evaluate")
+    p.add_argument("--seed", type=int, default=DEFAULT_SAMPLE_SEED,
+                   help="Seed for selecting the evaluated samples")
     return p.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
 
-    data_path = _REPO_ROOT / "data" / "puzzle_val.parquet"
-    df = pd.read_parquet(data_path)
-    n = min(args.n, len(df))
-    df = df.iloc[:n]
+    ds = load_processed_split(args.split)
+    n = min(args.n, len(ds))
+    sampled_rows = sample_rows(list(ds), n_samples=n, seed=args.seed)
 
     rows: list[dict] = []
-    for _, row in df.iterrows():
+    for row in sampled_rows:
         prompt = row["prompt"]
         if hasattr(prompt, "tolist"):
             prompt = prompt.tolist()
@@ -313,7 +315,7 @@ def main() -> None:
     out_dir = Path(args.out_dir)
 
     # Start lc0 servers (one per worker, one per GPU)
-    print(f"Loaded {n} samples from {data_path}")
+    print(f"Loaded {n} samples from ssingh22/llamia-verl-data/puzzle_popularity_elo:{args.split}")
     print(f"Configs:  {[c['label'] for c in active_configs]}")
     print(f"Workers:  {args.workers} per config (1 lc0 server per GPU)")
     print(f"Out dir:  {out_dir}")

@@ -24,7 +24,7 @@ from typing import Any
 import numpy as np
 
 _LOG_PATH   = os.environ.get("PUZZLE_TRACE_LOG",   "logs/puzzle_traces.jsonl")
-_VAL_SOURCE = os.environ.get("PUZZLE_VAL_SOURCE",  "llamia-puzzle-val")
+_VAL_SOURCE = os.environ.get("PUZZLE_VAL_SOURCE",  "puzzle_popularity_elo/test")
 _TRAIN_FLUSH = int(os.environ.get("PUZZLE_WANDB_FLUSH", "64"))
 # 200 val prompts × 8 rollouts; override if val_size or rollout_n differ.
 _VAL_FLUSH   = int(os.environ.get("PUZZLE_VAL_FLUSH", "1600"))

@@ -26,7 +26,9 @@ actor_rollout_ref:
     # DAPO Clip-Higher: ε_low=0.2, ε_high=0.28 (clip_ratio_low/high verified)
     clip_ratio_low: 0.2
     clip_ratio_high: 0.28
-    entropy_coeff: 0.0
+    # EGPO entropy bonus (arXiv 2508.05118): specifically improves Qwen3-4B on BFCL.
+    # Defends against entropy collapse after Clip-Higher; 0.001 is the conservative start.
+    entropy_coeff: 0.001
     fsdp_config:
       param_offload: false
       optimizer_offload: false
@@ -89,8 +91,11 @@ reward_model:
 # ── Data ───────────────────────────────────────────────────────────────────
 data:
   tokenizer: Qwen/Qwen3-4B
-  train_files: data/puzzle_train.parquet
-  val_files: data/puzzle_val.parquet
+  # Materialized from ssingh22/llamia-verl-data / puzzle_popularity_elo by
+  # scripts/train_puzzle_grpo.sh. HF remains the source of truth; set
+  # PUZZLE_N_TRAIN / PUZZLE_N_TEST / PUZZLE_SAMPLE_SEED to control samples.
+  train_files: .cache/llamia_verl_data/puzzle_popularity_elo/train.parquet
+  val_files: .cache/llamia_verl_data/puzzle_popularity_elo/test.parquet
   prompt_key: prompt
   reward_fn_key: data_source
   max_prompt_length: 1024

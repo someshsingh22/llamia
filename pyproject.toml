@@ -5,7 +5,12 @@ description = "LLM training with VERL + vLLM"
 requires-python = ">=3.10"
 dependencies = [
     "chess>=1.11.2",
+    "datasets>=4.8.4",
     "httpx>=0.28.1",
+    "numpy>=1.26.4",
+    "pyarrow>=24.0.0",
+    "python-dotenv>=1.2.2",
+    "scipy>=1.15.3",
     "verl>=0.7.1",
     "vllm>=0.9.1",
     "wandb>=0.26.1",
