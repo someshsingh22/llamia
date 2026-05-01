@@ -144,24 +144,38 @@ agents/
 └── chess_analyst.py  # ChessAnalyst — agentic loop (LLM + tool dispatch)
 ```
 
+`ChessAnalyst` supports multiple LLM providers via `provider=` constructor arg and `--provider` CLI flag:
+
+| `provider` | `model` | Auth | Notes |
+|---|---|---|---|
+| `vllm` (default) | `Qwen/Qwen3-4B` | none | Local vLLM server; Qwen3.5 XML tool-call parsing |
+| `azure` | `gpt-5` | `AZURE_API_KEY`, `AZURE_OPENAI_API_ENDPOINT`, `AZURE_OPENAI_API_VERSION` | GPT-5/o-series: `max_completion_tokens=16000`, no temperature |
+| `azure` | `claude-sonnet-4-6`, `claude-opus-4-6` | same Azure creds | Claude via native Anthropic SDK; base URL auto-derived: `{resource}.services.ai.azure.com/anthropic` |
+| `anthropic` | `claude-*` | `ANTHROPIC_API_KEY` | Direct Anthropic API |
+| `openai` | `gpt-4o` | `OPENAI_API_KEY` | Standard OpenAI |
+
 **Run:**
 ```bash
 source .venv/bin/activate
-python scripts/run_analyst.py "Why is Nxd4 a blunder here, rnbqkb1r/pp2pppp/5n2/6B1/2pp4/4PN2/PP3PPP/RN1QKB1R w KQkq - 0 6"
+# vLLM (default)
+python scripts/run_analyst.py "Why is Nxd4 a blunder? rnbqkb1r/pp2pppp/5n2/6B1/2pp4/4PN2/PP3PPP/RN1QKB1R w KQkq - 0 6"
+# Azure GPT-5
+python scripts/run_analyst.py "Best plan?" --provider azure --model gpt-5
+# Azure Claude (native Anthropic SDK, auto-routes to services.ai.azure.com/anthropic)
+python scripts/run_analyst.py "Best plan?" --provider azure --model claude-sonnet-4-6
 ```
 
-FENs embedded anywhere in the query are extracted automatically and set as the starting position. Moves accept both UCI (e2e4) and SAN (Nxd4).
+**Provider implementation details:**
+- **vLLM/Qwen**: `choice.message.tool_calls` checked first (Qwen3 + hermes parser), XML fallback for Qwen3.5. `extra_body={"chat_template_kwargs": {"enable_thinking": False}}`. `max_tokens=700`, `temperature=0`.
+- **Azure GPT-5/o-series**: `AzureOpenAI` client. `max_completion_tokens=16000` (internal reasoning consumes the budget — 700 tokens always exhausted). No `temperature` param (rejected). Standard `message.tool_calls` JSON.
+- **Azure Claude**: `anthropic.Anthropic` SDK. Separate agent loop: system prompt as top-level param, tool defs in `input_schema` format, tool results in user messages as `tool_result` blocks. `max_tokens=1024`, `temperature=0`. Base URL: `https://{resource}.services.ai.azure.com/anthropic` (auto-derived from `AZURE_OPENAI_API_ENDPOINT`; override with `AZURE_ANTHROPIC_BASE_URL`).
 
-**Tool-call format quirk — important:**
-Qwen3.5's chat template generates tool calls in its own XML format:
+**Eval on benchmark:**
+```bash
+# 100 samples from puzzle_val.parquet, 5 workers per provider
+python scripts/eval_providers.py --providers azure:gpt-5 azure:claude-sonnet-4-6 --n 100 --workers 5
+# Results saved to results/<provider>_<model>_<timestamp>.jsonl
 ```
-<tool_call>
-<function=name>
-<parameter=key>value</parameter>
-</function>
-</tool_call>
-```
-vllm's `--tool-call-parser hermes` finds the `<tool_call>` tags but cannot parse the inner XML as JSON, so `msg.tool_calls` is always `[]`. The agent parses tool calls from `msg.content` with `_parse_qwen_tool_calls()` in `chess_analyst.py`. **Do not rely on the standard `msg.tool_calls` field with this model/server.** Tool results are sent back as standard `role=tool` messages (the Qwen3.5 chat template handles them correctly on the server side).
 
 ## RL Training (VERL)
 
@@ -174,3 +188,60 @@ python -m verl.trainer.main_ppo \
   --config-path configs --config-name qwen3_ppo_vllm \
   data.train_files=data/train.parquet
 ```
+
+### Toy task: puzzle popularity + ELO
+
+End-to-end GRPO+DAPO loop on the popularity/ELO dimension of LLAMIA-Bench.
+
+```bash
+# 1. Build dataset (one-off; already done — data/puzzle_{train,val}.parquet)
+python -m data.prepare_puzzles --train-limit 2000 --val-limit 200
+
+# 2. Smoke-test rollouts (needs external vllm on port 7000 + lc0 on 7100)
+python -m scripts.test_rollout -n 20
+
+# 3. Stop external vllm (frees ~73 GB/GPU; lc0 stays up)
+pkill -f "vllm serve Qwen"
+
+# 4. Toy training (all 8 GPUs shared with lc0; 100 steps smoke, then lift)
+./scripts/train_puzzle_grpo.sh trainer.total_training_steps=100
+
+# Smoke-run (5 steps, no val, console-only logging):
+./scripts/train_puzzle_grpo.sh \
+  trainer.total_training_steps=5 \
+  trainer.val_before_train=false \
+  'trainer.logger=["console"]' \
+  data.train_batch_size=16 \
+  'actor_rollout_ref.rollout.n=4'
+```
+
+**Reward**: format-gated regression. Answer must match `popularity is <int> and the ELO is <int>`.
+Score = `fmt × (½·R_pop + ½·R_elo)`, `R_x = max(0, 1 − |err|/scale)`, scales 50 / 400.
+See `rewards/puzzle_reward.py`.
+
+**Tools at training time**: VERL `tool_agent_loop` (`@register("tool_agent")`) drives
+multi-turn rollouts via `agents/verl_tool_config.yaml`. Wrappers in `agents/verl_tools.py`
+share one `ChessState` per trajectory via `agent_data.extra_fields["chess_board"]`.
+
+**Config**: `configs/qwen3_puzzle_grpo.yaml`. Verified VERL 0.7.1 knobs:
+- `actor.loss_agg_mode: token-mean` — token-level policy gradient (DAPO)
+- `actor.clip_ratio_low/high: 0.2/0.28` — Clip-Higher (DAPO)
+- `algorithm.adv_estimator: grpo` + `rollout.n: 8` — GRPO group size
+- `rollout.multi_turn.enable: true` + `agent.default_agent_loop: tool_agent`
+- `data.apply_chat_template_kwargs: {enable_thinking: false}` — suppress Qwen3 think block
+
+Not in verl 0.7.1 schema (DAPO-deferred): dynamic_sampling, overlong_buffer penalty.
+
+### When RL goes wrong: rl_recipes.md
+
+`rl_recipes.md` (in repo root) is the practitioner's guide for tool-call GRPO/DAPO failure
+modes on Qwen3-class models. **Always consult it before patching training symptoms.**
+
+| Symptom | Section | Fix-of-first-resort |
+|---|---|---|
+| Reward stuck at 0.0 | §4 format/mode collapse | Verify format-pass on raw rollouts; SFT cold-start if <50% |
+| Reward variance → 0 mid-training | §4 echo trap | Confirm dynamic sampling (if available); lower KL β |
+| Tool-call rate drops to 0 | §4 direct-answer collapse | Add zero-tool-trajectory penalty; raise temperature |
+| Trajectory length explodes | §5 length bias | Token-Level Loss + Overlong soft penalty (deferred, monitor manually) |
+| Entropy collapse | §1 Clip-Higher | Verify ε_high=0.28; check ε_low isn't raised |
+| Qwen3 plans tool but never emits | §6 thinking-mode quirk | `enable_thinking: false` in rollout config |

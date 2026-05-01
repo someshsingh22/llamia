@@ -1,0 +1,86 @@
+# VERL tool registry for the puzzle popularity+ELO toy task.
+# Loaded by tool_agent_loop via ToolAgentLoop.__init__ → initialize_tools_from_config.
+# Each entry: class_name (dotted), config (must include type: native), tool_schema.
+# Board state is shared per trajectory via agent_data.extra_fields["chess_board"].
+
+tools:
+  - class_name: agents.verl_tools.GetPositionTool
+    config:
+      type: native
+    tool_schema:
+      type: function
+      function:
+        name: get_position
+        description: "Return current FEN, side to move, legal moves, and recent move history."
+        parameters:
+          type: object
+          properties: {}
+          required: []
+
+  - class_name: agents.verl_tools.AnalyzeTool
+    config:
+      type: native
+    tool_schema:
+      type: function
+      function:
+        name: analyze
+        description: "lc0 search: returns best move and scored lines. Pass moves=[...] to evaluate after that sequence without changing board state."
+        parameters:
+          type: object
+          properties:
+            nodes:
+              type: integer
+              description: "Search budget in nodes (default 800)."
+            multipv:
+              type: integer
+              description: "Number of top lines to return (default 3)."
+            moves:
+              type: string
+              description: "Optional comma-separated UCI/SAN moves to apply before analyzing (e.g. 'e2e4,e7e5')."
+          required: []
+
+  - class_name: agents.verl_tools.GetPolicyTool
+    config:
+      type: native
+    tool_schema:
+      type: function
+      function:
+        name: get_policy
+        description: "lc0 raw NN priors P and per-move values V from one forward pass."
+        parameters:
+          type: object
+          properties:
+            nodes:
+              type: integer
+              description: "Search budget; use 1 for pure NN prior, higher for Q-weighted values."
+          required: []
+
+  - class_name: agents.verl_tools.MakeMoveTool
+    config:
+      type: native
+    tool_schema:
+      type: function
+      function:
+        name: make_move
+        description: "Apply a UCI or SAN move to the current board. State persists for subsequent calls."
+        parameters:
+          type: object
+          properties:
+            move:
+              type: string
+              description: "Move in UCI (e2e4) or SAN (Nxd4) notation."
+          required:
+            - move
+
+  - class_name: agents.verl_tools.UndoMoveTool
+    config:
+      type: native
+    tool_schema:
+      type: function
+      function:
+        name: undo_move
+        description: "Undo the last make_move call and restore the previous position."
+        parameters:
+          type: object
+          properties: {}
+          required: []
