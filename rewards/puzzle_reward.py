@@ -39,10 +39,14 @@ def compute_score(
 
     if not format_pass:
         score = 0.0
-        pop_err = elo_err = -1.0  # sentinel: format failed
+        pop_err = elo_err = -1.0          # -1 sentinel used only in trace log
+        verl_pop_err = POP_SCALE          # max-error fill for VERL val means
+        verl_elo_err = ELO_SCALE
     else:
         pop_err = float(abs(pop_pred - int(ground_truth["popularity"])))
         elo_err = float(abs(elo_pred - int(ground_truth["elo"])))
+        verl_pop_err = pop_err
+        verl_elo_err = elo_err
         r_pop = max(0.0, 1.0 - pop_err / POP_SCALE)
         r_elo = max(0.0, 1.0 - elo_err / ELO_SCALE)
         score = 0.5 * r_pop + 0.5 * r_elo
@@ -60,23 +64,24 @@ def compute_score(
             "elo_pred": elo_pred,
             "pop_true": int(ground_truth.get("popularity", -1)),
             "elo_true": int(ground_truth.get("elo", -1)),
-            "pop_err": pop_err,
+            "pop_err": pop_err,        # -1 for format failures (trace only)
             "elo_err": elo_err,
             "tool_calls": tool_calls,
             "num_tool_calls": num_tool_calls,
             "solution_len": len(solution_str),
             "num_turns": (extra_info or {}).get("num_turns"),
-            # last 400 chars — enough to see the final answer and any format issues
             "tail": solution_str[-400:],
         })
     except Exception:
         pass  # never let logging break training
 
+    # verl_pop_err / verl_elo_err use POP_SCALE/ELO_SCALE for format failures
+    # so VERL's process_validation_metrics mean@N is meaningful (not distorted by -1).
     return {
         "score": score,
         "format_pass": float(format_pass),
-        "pop_err": pop_err,
-        "elo_err": elo_err,
+        "pop_err": verl_pop_err,
+        "elo_err": verl_elo_err,
         "num_tool_calls": float(num_tool_calls),
         "solution_len": float(len(solution_str)),
     }

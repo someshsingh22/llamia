@@ -10,10 +10,12 @@ the VERL data loader expects: a `prompt` column (list[dict]) and a
 from __future__ import annotations
 
 import argparse
+import hashlib
 import re
 from pathlib import Path
 from typing import Iterable
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -72,7 +74,10 @@ def build_rows(raw: Iterable[dict]) -> list[dict]:
                 "ground_truth": {"popularity": pop, "elo": elo},
             },
             "fen": fen,
-            "data_source": "ssingh22/llamia-chess-data",
+            # uid: stable per puzzle, used by VERL's process_validation_metrics
+            # to group multiple rollouts of the same prompt (for @N statistics).
+            "uid": hashlib.md5(fen.encode()).hexdigest()[:12],
+            "data_source": "ssingh22/llamia-chess-data",  # overridden per split below
         })
     return rows
 
@@ -88,29 +93,38 @@ def main():
     ap.add_argument("--out-dir", type=Path, default=Path("data"))
     ap.add_argument("--train-limit", type=int, default=4000)
     ap.add_argument("--val-limit", type=int, default=400)
+    ap.add_argument("--seed", type=int, default=42,
+                    help="RNG seed for reproducible shuffle before taking the first N rows")
     args = ap.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    for split, limit, name in [
-        ("train", args.train_limit, "puzzle_train.parquet"),
-        ("test", args.val_limit, "puzzle_val.parquet"),
+
+    # Each HF split is collected fully, then shuffled with the fixed seed before
+    # taking the first N rows — ensures identical puzzles across re-runs.
+    for hf_split, limit, name, data_source in [
+        ("train", args.train_limit, "puzzle_train.parquet", "llamia-puzzle-train"),
+        ("test",  args.val_limit,   "puzzle_val.parquet",   "llamia-puzzle-val"),
     ]:
         rows: list[dict] = []
-        for ex in _stream_split(split):
+        for ex in _stream_split(hf_split):
             built = build_rows([ex])
             rows.extend(built)
-            if len(rows) >= limit:
-                break
         if len(rows) < limit:
             raise RuntimeError(
                 f"{name}: only found {len(rows)} puzzle rows (needed {limit}). "
                 "The split may have fewer type_Puzzle examples than expected."
             )
-        rows = rows[:limit]
+        # Reproducible shuffle then slice
+        rng = np.random.default_rng(args.seed)
+        idx = rng.permutation(len(rows))[:limit]
+        rows = [rows[i] for i in idx]
+        # Stamp the split-specific data_source (used as wandb metric namespace)
+        for r in rows:
+            r["data_source"] = data_source
         table = pa.Table.from_pylist(rows)
         out = args.out_dir / name
         pq.write_table(table, out)
-        print(f"{name}: {len(rows)} puzzles → {out}")
+        print(f"{name}: {len(rows)} puzzles (seed={args.seed}) → {out}")
 
 
 if __name__ == "__main__":
