@@ -17,7 +17,8 @@ source .venv/bin/activate
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 
 echo "Starting GRPO toy run (puzzle popularity+ELO)…"
+# configs/qwen3_puzzle_grpo.yaml is symlinked into verl's trainer/config/ so
+# ppo_trainer (the defaults parent) resolves without --config-path override.
 python -m verl.trainer.main_ppo \
-    --config-path "$PWD/configs" \
     --config-name qwen3_puzzle_grpo \
     "$@"

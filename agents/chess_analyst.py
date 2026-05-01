@@ -1,4 +1,10 @@
-"""Chess analyst agent — Qwen3.5 LLM + lc0 engine tools.
+"""Chess analyst agent — multi-provider LLM + lc0 engine tools.
+
+Supports three providers:
+  "vllm"      — local vLLM server (Qwen3.5 with XML tool-call fallback)
+  "azure"     — AzureOpenAI (GPT-5 / o-series reasoning models)
+  "azure" + claude model — Azure-hosted Claude via native Anthropic SDK
+  "anthropic" — direct Anthropic API
 
 Qwen3.5's chat template uses its own XML-like tool call format:
     <tool_call>
@@ -14,8 +20,10 @@ msg.content.  We parse it ourselves with QWEN_TOOL_RE / PARAM_RE below.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import chess
@@ -88,8 +96,7 @@ EFFICIENCY: when two tool calls are independent (don't depend on each
 other's results), emit BOTH in your same response. The harness dispatches
 them in parallel — you save a full round-trip."""
 
-# Tool definitions fed to the API (used by vllm to build the chat template's
-# tool list, which teaches the model what functions exist and their parameters).
+# ── OpenAI-format tool definitions (vllm / azure-GPT) ─────────────────────────
 TOOL_DEFS = [
     {
         "type": "function",
@@ -176,6 +183,75 @@ TOOL_DEFS = [
     },
 ]
 
+# ── Anthropic-format tool definitions (claude on azure or direct anthropic) ───
+TOOL_DEFS_ANTHROPIC = [
+    {
+        "name": "get_position",
+        "description": "Return current FEN, side to move, legal moves, and recent move history.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "make_move",
+        "description": "Apply a move in UCI (e2e4) or SAN (Nxd4) notation to the current board.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "move": {"type": "string", "description": "Move in UCI or SAN notation"}
+            },
+            "required": ["move"],
+        },
+    },
+    {
+        "name": "undo_move",
+        "description": "Undo the last move.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "reset_position",
+        "description": "Reset board to a given FEN string.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"fen": {"type": "string"}},
+            "required": ["fen"],
+        },
+    },
+    {
+        "name": "analyze",
+        "description": (
+            "Run lc0 engine search on the current position, optionally AFTER "
+            "applying a sequence of hypothetical moves (does NOT mutate state). "
+            "Returns top moves with centipawn scores (positive = good for side to move) "
+            "and SAN principal variations. "
+            "Use `moves` to explore variations cheaply: e.g. analyze(moves=['Nxd4']) "
+            "returns the engine view after Nxd4 in ONE call — no make_move/undo needed."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "nodes": {"type": "integer", "description": "Search budget (default 800)"},
+                "multipv": {"type": "integer", "description": "Top moves to return (default 3)"},
+                "moves": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional UCI/SAN moves to apply before analyzing. State is unchanged.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_policy",
+        "description": "Get lc0 raw NN prior P and value V per move (minimal search, fast).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "nodes": {"type": "integer", "description": "Node budget (default: auto)"}
+            },
+            "required": [],
+        },
+    },
+]
+
 # Regex to extract a FEN from natural language (query may embed one)
 _FEN_RE = re.compile(
     r"[rnbqkpRNBQKP1-8]{1,8}(?:/[rnbqkpRNBQKP1-8]{1,8}){7}"
@@ -183,6 +259,9 @@ _FEN_RE = re.compile(
 )
 
 MAX_ROUNDS = 14
+
+# Read-only tools that can be fanned out in parallel (no board state mutation)
+READ_ONLY_TOOLS = {"analyze", "get_policy", "get_position"}
 
 
 class ChessAnalyst:
@@ -193,14 +272,81 @@ class ChessAnalyst:
         lc0_url: str = "http://localhost:7100",
         initial_fen: str | None = None,
         system_prompt: str | None = None,
+        provider: str = "vllm",
+        reasoning_effort: str | None = None,
     ):
         self.model = model
-        self.client = openai.OpenAI(base_url=llm_base_url, api_key="none")
+        self.provider = provider
+        self.reasoning_effort = reasoning_effort
         self.lc0 = LcOClient(base_url=lc0_url)
         self.state = ChessState(initial_fen or chess.STARTING_FEN)
         self.system_prompt = system_prompt or SYSTEM_PROMPT
-        # Per-run telemetry — populated by run()
         self.last_stats: dict = {}
+        self.last_trace: list[dict] = []
+
+        # Determine whether to use the Anthropic SDK path
+        is_claude = model.startswith("claude")
+        self._use_anthropic = (provider == "azure" and is_claude) or (provider == "anthropic")
+
+        if self._use_anthropic:
+            import anthropic  # local import to avoid hard dep when not used
+
+            if provider == "anthropic":
+                self.anth_client = anthropic.Anthropic(
+                    api_key=os.environ.get("ANTHROPIC_API_KEY", "")
+                )
+            else:
+                # azure + claude — derive services.ai.azure.com endpoint
+                endpoint = (
+                    os.environ.get("AZURE_ANTHROPIC_BASE_URL")
+                    or self._derive_anthropic_base_url(
+                        os.environ.get(
+                            "AZURE_OPENAI_API_ENDPOINT",
+                            os.environ.get("AZURE_API_BASE", ""),
+                        )
+                    )
+                )
+                self.anth_client = anthropic.Anthropic(
+                    base_url=endpoint,
+                    api_key=os.environ.get("AZURE_API_KEY", ""),
+                    default_headers={"api-key": os.environ.get("AZURE_API_KEY", "")},
+                )
+            self.client = None  # no OpenAI client in Anthropic path
+
+        elif provider == "azure":
+            self.client = openai.AzureOpenAI(
+                azure_endpoint=os.environ.get(
+                    "AZURE_OPENAI_API_ENDPOINT",
+                    os.environ.get("AZURE_API_BASE", ""),
+                ),
+                api_key=os.environ.get("AZURE_API_KEY", ""),
+                api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2025-01-01-preview"),
+            )
+            self.anth_client = None
+
+        else:
+            # vllm (default)
+            self.client = openai.OpenAI(base_url=llm_base_url, api_key="none")
+            self.anth_client = None
+
+    # ── Endpoint derivation ────────────────────────────────────────────────────
+    @staticmethod
+    def _derive_anthropic_base_url(cognitiveservices_endpoint: str) -> str:
+        """Convert a cognitiveservices endpoint to an Anthropic services URL.
+
+        Example:
+            https://mdsr-foundry-resource.cognitiveservices.azure.com/
+            → https://mdsr-foundry-resource.services.ai.azure.com/anthropic
+        """
+        m = re.match(
+            r"https://([^.]+)\.cognitiveservices\.azure\.com",
+            cognitiveservices_endpoint,
+        )
+        if m:
+            name = m.group(1)
+            return f"https://{name}.services.ai.azure.com/anthropic"
+        # Fallback: return as-is (may already be the correct URL)
+        return cognitiveservices_endpoint.rstrip("/")
 
     # ── Tool dispatch ──────────────────────────────────────────────────────────
     def _dispatch(self, name: str, args: dict) -> Any:
@@ -236,7 +382,56 @@ class ChessAnalyst:
             )
         return {"error": f"Unknown tool: {name}"}
 
-    # ── Agent loop ─────────────────────────────────────────────────────────────
+    # ── Parallel execution helper ──────────────────────────────────────────────
+    def _execute_calls(
+        self,
+        tool_calls: list[dict],
+        verbose: bool,
+    ) -> list[tuple[dict, Any]]:
+        """Execute tool calls, fanning out read-only ones in parallel.
+
+        Each element of `tool_calls` is a dict with keys ``name`` and
+        ``arguments``.  Returns a list of ``(call_dict, result)`` pairs in the
+        same order as ``tool_calls``.
+        """
+        ro_calls = [c for c in tool_calls if c["name"] in READ_ONLY_TOOLS]
+        mut_calls = [c for c in tool_calls if c["name"] not in READ_ONLY_TOOLS]
+
+        results: list[tuple[dict, Any]] = []
+
+        if len(ro_calls) > 1:
+            with ThreadPoolExecutor(max_workers=len(ro_calls)) as pool:
+                futures = [
+                    pool.submit(self._dispatch, c["name"], c["arguments"])
+                    for c in ro_calls
+                ]
+                for c, fut in zip(ro_calls, futures):
+                    results.append((c, fut.result()))
+        else:
+            for c in ro_calls:
+                results.append((c, self._dispatch(c["name"], c["arguments"])))
+
+        # Mutating calls run after reads, in the order the model emitted them.
+        for c in mut_calls:
+            results.append((c, self._dispatch(c["name"], c["arguments"])))
+
+        # Re-sort to the model's original call order.
+        order_idx = {id(c): i for i, c in enumerate(tool_calls)}
+        results.sort(key=lambda pair: order_idx[id(pair[0])])
+
+        if verbose:
+            for call, result in results:
+                name = call["name"]
+                args = call["arguments"]
+                arg_str = ", ".join(f"{k}={v!r}" for k, v in args.items())
+                print(f"  ⚙  {name}({arg_str})")
+                rs = json.dumps(result, indent=2)
+                preview = rs[:500] + ("..." if len(rs) > 500 else "")
+                print(f"     -> {preview}\n")
+
+        return results
+
+    # ── Public entry point ─────────────────────────────────────────────────────
     def run(self, query: str, verbose: bool = True) -> str:
         # Auto-detect and load FEN embedded in the query
         fen_loaded = False
@@ -249,14 +444,26 @@ class ChessAnalyst:
                 if verbose:
                     print(f"[Board] Position set: {fen}\n")
 
-        # Drop reset_position from the tool list when we already loaded a FEN.
-        # Without it in the tool catalogue the model is far less likely to
-        # propose it, and if it does (from training prior), the dispatcher
-        # rejects it with a clear message instead of silently succeeding.
+        self._reset_locked = fen_loaded  # checked in _dispatch
+
+        if self._use_anthropic:
+            return self._run_anthropic_loop(query, fen_loaded=fen_loaded, verbose=verbose)
+        else:
+            return self._run_openai_loop(query, fen_loaded=fen_loaded, verbose=verbose)
+
+    # ── OpenAI / vLLM / Azure-GPT loop ────────────────────────────────────────
+    def _run_openai_loop(
+        self,
+        query: str,
+        fen_loaded: bool,
+        verbose: bool,
+    ) -> str:
+        is_vllm = self.provider == "vllm"
+
+        # Drop reset_position when the FEN was already loaded from the query.
         active_tools = TOOL_DEFS if not fen_loaded else [
             t for t in TOOL_DEFS if t["function"]["name"] != "reset_position"
         ]
-        self._reset_locked = fen_loaded  # checked in _dispatch
 
         messages: list[dict] = [
             {"role": "system", "content": self.system_prompt},
@@ -266,28 +473,46 @@ class ChessAnalyst:
         tool_call_count = 0
         llm_round_count = 0
         tool_breakdown: dict[str, int] = {}
+        _trace: list[dict] = []
 
-        for round_idx in range(MAX_ROUNDS):
+        for _round_idx in range(MAX_ROUNDS):
             llm_round_count += 1
-            resp = self.client.chat.completions.create(
+
+            # Build kwargs — GPT-5 (azure) and vllm differ on several params
+            call_kwargs: dict[str, Any] = dict(
                 model=self.model,
                 messages=messages,
                 tools=active_tools,
                 tool_choice="auto",
-                max_tokens=700,
-                temperature=0.0,
-                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
+            if self.provider == "azure":
+                # GPT-5 / o-series: use max_completion_tokens, no temperature,
+                # no extra_body (reasoning model rejects them)
+                call_kwargs["max_completion_tokens"] = 16000
+                if self.reasoning_effort:
+                    call_kwargs["reasoning_effort"] = self.reasoning_effort
+            else:
+                # vllm / local
+                call_kwargs["max_tokens"] = 700
+                call_kwargs["temperature"] = 0.0
+                call_kwargs["extra_body"] = {
+                    "chat_template_kwargs": {"enable_thinking": False}
+                }
+
+            resp = self.client.chat.completions.create(**call_kwargs)
             choice = resp.choices[0]
             raw_content: str = choice.message.content or ""
 
             # Print thinking if the reasoning parser exposes it
             thinking = getattr(choice.message, "reasoning_content", None)
             if thinking and verbose:
-                print(f"[Thinking] {thinking[:400]}{'…' if len(thinking) > 400 else ''}\n")
+                print(
+                    f"[Thinking] {thinking[:400]}"
+                    f"{'...' if len(thinking) > 400 else ''}\n"
+                )
 
-            # ── Tool calls: standard OpenAI field first (Qwen3 + hermes parser),
-            #    falling back to Qwen3.5 inline XML in content.
+            # Tool calls: standard OpenAI field first (works for GPT-5 and
+            # Qwen3 + hermes parser), falling back to Qwen3.5 inline XML.
             tool_calls: list[dict] = []
             if choice.message.tool_calls:
                 for tc in choice.message.tool_calls:
@@ -298,13 +523,17 @@ class ChessAnalyst:
                     tool_calls.append({"name": tc.function.name, "arguments": args})
                 visible_text = raw_content.strip()
             else:
-                tool_calls = _parse_qwen_tool_calls(raw_content)
-                visible_text = _strip_tool_calls(raw_content)
+                if is_vllm:
+                    # XML fallback only for vllm/Qwen3.5
+                    tool_calls = _parse_qwen_tool_calls(raw_content)
+                    visible_text = _strip_tool_calls(raw_content)
+                else:
+                    visible_text = raw_content.strip()
 
             if visible_text and verbose:
                 print(f"[LLM] {visible_text}\n")
 
-            # Append assistant turn. With OpenAI-format tool calls we must
+            # Append assistant turn.  With OpenAI-format tool calls we must
             # echo them back as `tool_calls` (each paired with a tool_call_id)
             # so the chat template can match the subsequent role=tool replies.
             assistant_msg: dict = {"role": "assistant", "content": raw_content or ""}
@@ -321,6 +550,7 @@ class ChessAnalyst:
                     for tc in choice.message.tool_calls
                 ]
             messages.append(assistant_msg)
+
             _openai_tc_ids = (
                 [tc.id for tc in choice.message.tool_calls]
                 if choice.message.tool_calls else None
@@ -328,65 +558,228 @@ class ChessAnalyst:
 
             # No tool calls → final answer
             if not tool_calls:
+                _trace.append({
+                    "round": llm_round_count,
+                    "thinking": thinking or "",
+                    "text": visible_text or raw_content,
+                    "tool_calls": [],
+                })
                 self.last_stats = {
                     "llm_rounds": llm_round_count,
                     "tool_calls": tool_call_count,
                     "tool_breakdown": tool_breakdown,
                     "forced": False,
                 }
+                self.last_trace = _trace
                 if verbose:
                     print(f"\n{'─'*60}\n[Answer]\n{visible_text or raw_content}\n")
                 return visible_text or raw_content
 
-            # Execute tool calls.  Pure-read, no-state-mutation tools
-            # (analyze, get_policy, get_position) run in parallel via threads;
-            # state-mutating tools (make_move, undo_move, reset_position)
-            # MUST stay sequential because order matters.
-            READ_ONLY_TOOLS = {"analyze", "get_policy", "get_position"}
-            ro_calls = [c for c in tool_calls if c["name"] in READ_ONLY_TOOLS]
-            mut_calls = [c for c in tool_calls if c["name"] not in READ_ONLY_TOOLS]
+            # Execute with parallel fan-out for read-only tools
+            pairs = self._execute_calls(tool_calls, verbose=verbose)
 
-            results: list[tuple[dict, Any]] = []
-            if len(ro_calls) > 1:
-                # Fan-out: dispatch all read-only calls concurrently.
-                from concurrent.futures import ThreadPoolExecutor
-                with ThreadPoolExecutor(max_workers=len(ro_calls)) as pool:
-                    futures = [pool.submit(self._dispatch, c["name"], c["arguments"])
-                               for c in ro_calls]
-                    for c, fut in zip(ro_calls, futures):
-                        results.append((c, fut.result()))
-            else:
-                for c in ro_calls:
-                    results.append((c, self._dispatch(c["name"], c["arguments"])))
-
-            # Mutating calls run after the reads, in the order the model emitted them.
-            for c in mut_calls:
-                results.append((c, self._dispatch(c["name"], c["arguments"])))
-
-            # Re-emit results in the model's original call order so the
-            # tool-response messages line up with what it expects.
-            order_idx = {id(c): i for i, c in enumerate(tool_calls)}
-            results.sort(key=lambda pair: order_idx[id(pair[0])])
-
-            for idx, (call, result) in enumerate(results):
+            tc_trace: list[dict] = []
+            for idx, (call, result) in enumerate(pairs):
                 name = call["name"]
-                args = call["arguments"]
                 tool_call_count += 1
                 tool_breakdown[name] = tool_breakdown.get(name, 0) + 1
-
-                if verbose:
-                    arg_str = ", ".join(f"{k}={v!r}" for k, v in args.items())
-                    print(f"  ⚙  {name}({arg_str})")
-                    rs = json.dumps(result, indent=2)
-                    preview = rs[:500] + ("…" if len(rs) > 500 else "")
-                    print(f"     → {preview}\n")
+                tc_trace.append({"name": name, "input": call["arguments"], "output": result})
 
                 tool_msg: dict = {"role": "tool", "content": json.dumps(result)}
                 if _openai_tc_ids and idx < len(_openai_tc_ids):
                     tool_msg["tool_call_id"] = _openai_tc_ids[idx]
                 messages.append(tool_msg)
 
-        # Fallback: all tool call rounds spent — explicitly ask for the answer.
+            _trace.append({
+                "round": llm_round_count,
+                "thinking": thinking or "",
+                "text": visible_text,
+                "tool_calls": tc_trace,
+            })
+
+        # Fallback: tool call rounds exhausted — force a plain-text answer.
+        forced_kwargs: dict[str, Any] = dict(model=self.model, messages=messages + [{
+            "role": "user",
+            "content": (
+                "You have collected all the engine data needed. "
+                "Now write your complete analysis as plain text. No tool calls."
+            ),
+        }])
+        if self.provider == "azure":
+            forced_kwargs["max_completion_tokens"] = 16000
+            if self.reasoning_effort:
+                forced_kwargs["reasoning_effort"] = self.reasoning_effort
+        else:
+            forced_kwargs["max_tokens"] = 700
+            forced_kwargs["temperature"] = 0.0
+            forced_kwargs["extra_body"] = {
+                "chat_template_kwargs": {"enable_thinking": False}
+            }
+
+        resp = self.client.chat.completions.create(**forced_kwargs)
+        final = _strip_tool_calls(resp.choices[0].message.content or "")
+        forced_thinking = getattr(resp.choices[0].message, "reasoning_content", None) or ""
+        _trace.append({
+            "round": llm_round_count + 1,
+            "thinking": forced_thinking,
+            "text": final,
+            "tool_calls": [],
+        })
+        self.last_stats = {
+            "llm_rounds": llm_round_count + 1,
+            "tool_calls": tool_call_count,
+            "tool_breakdown": tool_breakdown,
+            "forced": True,
+        }
+        self.last_trace = _trace
+        if verbose:
+            print(f"\n{'─'*60}\n[Answer]\n{final}\n")
+        return final
+
+    # ── Anthropic / Azure-Claude loop ──────────────────────────────────────────
+    def _run_anthropic_loop(
+        self,
+        query: str,
+        fen_loaded: bool,
+        verbose: bool,
+    ) -> str:
+        # Drop reset_position when the FEN was already loaded from the query.
+        active_tools = TOOL_DEFS_ANTHROPIC if not fen_loaded else [
+            t for t in TOOL_DEFS_ANTHROPIC if t["name"] != "reset_position"
+        ]
+
+        # Anthropic format: system goes as a top-level param, not in messages.
+        messages: list[dict] = [
+            {"role": "user", "content": query},
+        ]
+
+        tool_call_count = 0
+        llm_round_count = 0
+        tool_breakdown: dict[str, int] = {}
+        _trace: list[dict] = []
+
+        # Map effort label → thinking budget_tokens for Claude extended thinking.
+        _EFFORT_BUDGET = {"low": 1024, "medium": 4096, "high": 8192}
+        _thinking_budget = _EFFORT_BUDGET.get(self.reasoning_effort or "", 0) if self.reasoning_effort else 0
+        # max_tokens must exceed budget; add 2048 for response text.
+        _max_tokens = max(1024, _thinking_budget + 2048)
+
+        def _anth_call(msgs: list[dict]) -> Any:
+            kwargs: dict[str, Any] = dict(
+                model=self.model,
+                system=self.system_prompt,
+                messages=msgs,
+                tools=active_tools,
+                max_tokens=_max_tokens,
+            )
+            if _thinking_budget:
+                kwargs["thinking"] = {"type": "enabled", "budget_tokens": _thinking_budget}
+                kwargs["temperature"] = 1.0  # required when extended thinking is on
+            else:
+                kwargs["temperature"] = 0.0
+            return self.anth_client.messages.create(**kwargs)
+
+        for _round_idx in range(MAX_ROUNDS):
+            llm_round_count += 1
+
+            resp = _anth_call(messages)
+
+            # Content blocks: thinking, text, tool_use
+            thinking_parts: list[str] = []
+            text_parts: list[str] = []
+            tool_use_blocks: list[Any] = []
+            for block in resp.content:
+                if block.type == "thinking":
+                    thinking_parts.append(getattr(block, "thinking", ""))
+                elif block.type == "text":
+                    text_parts.append(block.text)
+                elif block.type == "tool_use":
+                    tool_use_blocks.append(block)
+
+            thinking_text = "\n".join(thinking_parts).strip()
+            visible_text = "\n".join(text_parts).strip()
+
+            if thinking_text and verbose:
+                print(
+                    f"[Thinking] {thinking_text[:400]}"
+                    f"{'...' if len(thinking_text) > 400 else ''}\n"
+                )
+            if visible_text and verbose:
+                print(f"[LLM] {visible_text}\n")
+
+            # Serialize assistant message as content block dicts so we can
+            # replay it back in the messages list on the next turn.
+            assistant_content: list[dict] = []
+            for block in resp.content:
+                if block.type == "thinking":
+                    assistant_content.append({
+                        "type": "thinking",
+                        "thinking": getattr(block, "thinking", ""),
+                        "signature": getattr(block, "signature", ""),
+                    })
+                elif block.type == "text":
+                    assistant_content.append({"type": "text", "text": block.text})
+                elif block.type == "tool_use":
+                    assistant_content.append({
+                        "type": "tool_use",
+                        "id": block.id,
+                        "name": block.name,
+                        "input": block.input,
+                    })
+            messages.append({"role": "assistant", "content": assistant_content})
+
+            # Done when end_turn or no tool calls requested
+            if resp.stop_reason == "end_turn" or not tool_use_blocks:
+                _trace.append({
+                    "round": llm_round_count,
+                    "thinking": thinking_text,
+                    "text": visible_text,
+                    "tool_calls": [],
+                })
+                self.last_stats = {
+                    "llm_rounds": llm_round_count,
+                    "tool_calls": tool_call_count,
+                    "tool_breakdown": tool_breakdown,
+                    "forced": False,
+                }
+                self.last_trace = _trace
+                if verbose:
+                    print(f"\n{'─'*60}\n[Answer]\n{visible_text}\n")
+                return visible_text
+
+            # Build the normalized tool_calls list for _execute_calls
+            norm_calls: list[dict] = [
+                {"name": b.name, "arguments": b.input or {}, "_anth_block": b}
+                for b in tool_use_blocks
+            ]
+
+            pairs = self._execute_calls(norm_calls, verbose=verbose)
+
+            # Accumulate stats and build tool-result user message
+            tc_trace: list[dict] = []
+            tool_result_content: list[dict] = []
+            for call, result in pairs:
+                name = call["name"]
+                block = call["_anth_block"]
+                tool_call_count += 1
+                tool_breakdown[name] = tool_breakdown.get(name, 0) + 1
+                tc_trace.append({"name": name, "input": call["arguments"], "output": result})
+
+                tool_result_content.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": json.dumps(result),
+                })
+
+            _trace.append({
+                "round": llm_round_count,
+                "thinking": thinking_text,
+                "text": visible_text,
+                "tool_calls": tc_trace,
+            })
+            messages.append({"role": "user", "content": tool_result_content})
+
+        # Fallback: rounds exhausted — ask for plain-text answer
         messages.append({
             "role": "user",
             "content": (
@@ -394,20 +787,25 @@ class ChessAnalyst:
                 "Now write your complete analysis as plain text. No tool calls."
             ),
         })
-        resp = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            max_tokens=700,
-            temperature=0.0,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-        )
-        final = _strip_tool_calls(resp.choices[0].message.content or "")
+        resp = _anth_call(messages)
+        final_thinking = "\n".join(
+            getattr(b, "thinking", "") for b in resp.content if b.type == "thinking"
+        ).strip()
+        final_parts = [b.text for b in resp.content if b.type == "text"]
+        final = "\n".join(final_parts).strip()
+        _trace.append({
+            "round": llm_round_count + 1,
+            "thinking": final_thinking,
+            "text": final,
+            "tool_calls": [],
+        })
         self.last_stats = {
             "llm_rounds": llm_round_count + 1,
             "tool_calls": tool_call_count,
             "tool_breakdown": tool_breakdown,
             "forced": True,
         }
+        self.last_trace = _trace
         if verbose:
             print(f"\n{'─'*60}\n[Answer]\n{final}\n")
         return final

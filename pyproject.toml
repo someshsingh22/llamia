@@ -8,6 +8,7 @@ dependencies = [
     "httpx>=0.28.1",
     "verl>=0.7.1",
     "vllm>=0.9.1",
+    "wandb>=0.26.1",
 ]
 
 [tool.uv]
