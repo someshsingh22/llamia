@@ -1,6 +1,14 @@
+# Local agent/editor state
 .claude/
 .remember/
+CLAUDE.md
+
+# Documentation and paper workspaces
 *.md
+docs/
+llamiaTex/
+
+# Secrets
 .env
 
 # Python / uv environments
@@ -8,10 +16,18 @@
 __pycache__/
 *.pyc
 
+# Data and run artifacts
+data/*.parquet
+data/*.jsonl
+checkpoints/
+outputs/
+results/
+logs/
+
 # Engine weights (large; fetched on demand)
 lc0_server/weights/*.pb.gz
 
-# logs
+# Logs and scratch output
 *.log
 *.txt
 
