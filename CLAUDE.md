@@ -234,7 +234,20 @@ pkill -f "vllm serve Qwen"
 
 **Reward**: format-gated regression. Answer must match `popularity is <int> and the ELO is <int>`.
 Score = `fmt × (½·R_pop + ½·R_elo)`, `R_x = max(0, 1 − |err|/scale)`, scales 50 / 400.
+`compute_score` returns a dict so VERL stores `format_pass`, `pop_err`, `elo_err`, `num_tool_calls`, `solution_len` in `batch.non_tensor_batch` alongside the scalar reward.
 See `rewards/puzzle_reward.py`.
+
+**Trace logging**: every scored trajectory is appended to `logs/puzzle_traces.jsonl`
+(O_APPEND atomic writes; safe across Ray worker processes). Override path with
+`PUZZLE_TRACE_LOG=path` env var.
+
+```bash
+# Live rolling stats (run in a second terminal alongside training):
+python scripts/watch_reward.py --window 64 --interval 5
+
+# Post-hoc analysis (reward mean±std, format rate, tool breakdown, examples):
+python scripts/analyze_traces.py logs/puzzle_traces.jsonl --last 500 --examples 3
+```
 
 **Tools at training time**: VERL `tool_agent_loop` (`@register("tool_agent")`) drives
 multi-turn rollouts via `agents/verl_tool_config.yaml`. Wrappers in `agents/verl_tools.py`
