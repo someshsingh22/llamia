@@ -16,6 +16,8 @@ import re
 from typing import Any, Optional
 from uuid import uuid4
 
+import itertools
+
 import chess
 
 from verl.tools.base_tool import BaseTool
@@ -26,7 +28,13 @@ from .tools import LcOClient
 
 _FEN_RE = re.compile(r"FEN:\s*(\S+)")
 
-_LC0 = LcOClient(base_url="http://localhost:7100")
+# Round-robin pool over the 8 lc0 servers (ports 7100–7107).
+_LC0_POOL = [LcOClient(base_url=f"http://localhost:{7100 + i}") for i in range(8)]
+_LC0_CYCLE = itertools.cycle(_LC0_POOL)
+
+
+def _next_lc0() -> LcOClient:
+    return next(_LC0_CYCLE)
 
 # instance_id -> initial_fen; populated in create(), cleared in release().
 _INSTANCE_FEN: dict[str, str] = {}
@@ -101,7 +109,7 @@ class AnalyzeTool(_ChessBaseTool):
         else:
             moves = moves_raw or None
         try:
-            result = _LC0.analyze(
+            result = _next_lc0().analyze(
                 state.fen,
                 nodes=int(parameters.get("nodes", 800)),
                 multipv=int(parameters.get("multipv", 3)),
@@ -118,7 +126,7 @@ class GetPolicyTool(_ChessBaseTool):
         state = _get_board(instance_id, agent_data)
         nodes_raw = parameters.get("nodes")
         try:
-            result = _LC0.get_policy(
+            result = _next_lc0().get_policy(
                 state.fen,
                 nodes=int(nodes_raw) if nodes_raw is not None else None,
             )

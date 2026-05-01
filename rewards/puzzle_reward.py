@@ -7,7 +7,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from .parser import parse_popularity_elo
+try:
+    from .parser import parse_popularity_elo
+except ImportError:
+    # When loaded via load_extern_object (standalone file, not package import)
+    from rewards.parser import parse_popularity_elo
 
 POP_SCALE = 50.0   # within ±50 popularity points → linear partial credit
 ELO_SCALE = 400.0  # within ±400 Elo → linear partial credit

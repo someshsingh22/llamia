@@ -170,10 +170,27 @@ python scripts/run_analyst.py "Best plan?" --provider azure --model claude-sonne
 - **Azure GPT-5/o-series**: `AzureOpenAI` client. `max_completion_tokens=16000` (internal reasoning consumes the budget — 700 tokens always exhausted). No `temperature` param (rejected). Standard `message.tool_calls` JSON.
 - **Azure Claude**: `anthropic.Anthropic` SDK. Separate agent loop: system prompt as top-level param, tool defs in `input_schema` format, tool results in user messages as `tool_result` blocks. `max_tokens=1024`, `temperature=0`. Base URL: `https://{resource}.services.ai.azure.com/anthropic` (auto-derived from `AZURE_OPENAI_API_ENDPOINT`; override with `AZURE_ANTHROPIC_BASE_URL`).
 
-**Eval on benchmark:**
+**Reasoning effort control** (`reasoning_effort=` constructor arg):
+- **GPT-5**: passes `reasoning_effort="low"|"medium"|"high"` directly to the Azure API
+- **Claude**: maps to extended thinking budget — low→1024 tokens, medium→4096, high→8192; sets `thinking={"type":"enabled","budget_tokens":N}` and `temperature=1.0` (required)
+- Thinking/reasoning content is captured per-turn in `analyst.last_trace`
+
+**Raw-output eval** (`scripts/eval_raw.py`):
 ```bash
-# 100 samples from puzzle_val.parquet, 5 workers per provider
-python scripts/eval_providers.py --providers azure:gpt-5 azure:claude-sonnet-4-6 --n 100 --workers 5
+# Edit EVAL_CONFIG dict at top of the script to select models/efforts, then:
+python scripts/eval_raw.py --n 100 --workers 8   # 8 workers → 8 lc0 servers on GPUs 0-7
+python scripts/eval_raw.py --labels gpt-5-low claude-sonnet-4-6-medium --n 50
+# Output JSONL in results/raw/<label>_<timestamp>.jsonl
+# Each row: idx, label, model, effort, fen, pred/true pop+elo, trace[]
+# trace[i]: {round, thinking, text, tool_calls:[{name, input, output}]}
+```
+
+Each worker gets its own dedicated lc0 server (started automatically on GPU i, port 7100+i).
+`--lc0-base-port` overrides the starting port (default 7100).
+
+**Eval on benchmark (legacy, no raw traces):**
+```bash
+python scripts/eval_providers.py --providers azure:gpt-5 azure:claude-sonnet-4-6 --n 100 --workers 3
 # Results saved to results/<provider>_<model>_<timestamp>.jsonl
 ```
 
