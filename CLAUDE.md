@@ -223,23 +223,28 @@ pkill -f "vllm serve Qwen"
 # 4. Toy training (all 8 GPUs shared with lc0; 100 steps smoke, then lift)
 ./scripts/train_puzzle_grpo.sh trainer.total_training_steps=100
 
-# Smoke-run (5 steps, no val, console-only logging):
-./scripts/train_puzzle_grpo.sh \
+# Smoke-run (5 steps, no val; smaller batch → set flush size to match):
+PUZZLE_WANDB_FLUSH=16 ./scripts/train_puzzle_grpo.sh \
   trainer.total_training_steps=5 \
   trainer.val_before_train=false \
-  'trainer.logger=["console"]' \
   data.train_batch_size=16 \
   'actor_rollout_ref.rollout.n=4'
 ```
 
 **Reward**: format-gated regression. Answer must match `popularity is <int> and the ELO is <int>`.
 Score = `fmt × (½·R_pop + ½·R_elo)`, `R_x = max(0, 1 − |err|/scale)`, scales 50 / 400.
-`compute_score` returns a dict so VERL stores `format_pass`, `pop_err`, `elo_err`, `num_tool_calls`, `solution_len` in `batch.non_tensor_batch` alongside the scalar reward.
+`compute_score` returns a dict; VERL stores `format_pass`, `pop_err`, `elo_err`, `num_tool_calls`,
+`solution_len` in `batch.non_tensor_batch` alongside the scalar reward.
 See `rewards/puzzle_reward.py`.
 
-**Trace logging**: every scored trajectory is appended to `logs/puzzle_traces.jsonl`
-(O_APPEND atomic writes; safe across Ray worker processes). Override path with
-`PUZZLE_TRACE_LOG=path` env var.
+**Logging**: wandb project `llamia`, experiment `puzzle_grpo_toy`. Custom metrics logged
+to the same wandb run (same step) via `commit=False` accumulation in `rewards/trace_logger.py`:
+`reward/std`, `reward/format_pass_rate`, `reward/num_tool_calls`, `reward/solution_len`,
+`reward/pop_err_mean`, `reward/elo_err_mean`. Flush interval controlled by `PUZZLE_WANDB_FLUSH`
+(default 64 = full batch size).
+
+Every trajectory is also appended to `logs/puzzle_traces.jsonl` (O_APPEND, safe across Ray
+workers). Override path with `PUZZLE_TRACE_LOG=path`.
 
 ```bash
 # Live rolling stats (run in a second terminal alongside training):
